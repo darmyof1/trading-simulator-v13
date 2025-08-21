@@ -1,0 +1,9 @@
+# Git ignore file for excluding unnecessary files
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+*.log
+data/output/

@@ -1,0 +1,242 @@
+#################################################
+#Recreate environtment
+#################################################
+
+#Deactivat and remove
+cd /path/to/Trading\ Simulator     # <- your project folder
+deactivate 2>/dev/null || true
+rm -rf .venv
+
+#Verify Python version and activate
+/usr/local/bin/python3 -V          # should print 3.13.7
+/usr/local/bin/python3 -m venv .venv
+source .venv/bin/activate
+
+python3 --version
+python3 -m venv .venv
+source .venv/bin/activate
+
+
+
+
+#################################################
+##Install python
+#################################################
+brew update
+brew upgrade python
+python --version
+
+#################################################
+#Change Path order
+#################################################
+A) Point your shell to Homebrew’s Python (Intel Mac path)
+
+Skip any line that errors; they’re safe.
+
+# 0) Make sure no venv is active
+deactivate 2>/dev/null || true
+
+# 1) Confirm this is the Homebrew we’ll use
+/usr/local/bin/brew --prefix
+/usr/local/bin/brew --prefix python@3.13
+/usr/local/bin/brew list python@3.13 | head
+
+# 2) Put /usr/local/bin first in PATH for zsh (Intel Macs use /usr/local)
+/bin/cp -v ~/.zshrc ~/.zshrc.bak.$(date +%Y%m%d%H%M%S) 2>/dev/null || true
+grep -q 'export PATH="/usr/local/bin:$PATH"' ~/.zshrc || \
+  echo 'export PATH="/usr/local/bin:$PATH"' >> ~/.zshrc
+
+# 3) Remove python.org’s Framework path from your startup files if present
+# (This is what forces /Library/Frameworks/.../bin ahead of Homebrew.)
+sed -i '' '/Python\.framework\/Versions\/3\.13\/bin/d' ~/.zshrc 2>/dev/null || true
+sed -i '' '/Python\.framework\/Versions\/3\.13\/bin/d' ~/.zprofile 2>/dev/null || true
+sed -i '' '/Python\.framework\/Versions\/3\.13\/bin/d' ~/.bash_profile 2>/dev/null || true
+
+# 4) Reload your shell so PATH changes take effect
+exec zsh
+
+# 5) Ensure Homebrew’s python is linked and selected
+/usr/local/bin/brew link --overwrite python@3.13
+hash -r
+
+# 6) Verify we’re seeing 3.13.7 from /usr/local/bin
+which -a python3
+python3 -V
+ls -l /usr/local/bin/python3
+
+
+You want:
+
+python3 -V → Python 3.13.7
+
+which python3 → /usr/local/bin/python3 (not /Library/Frameworks/...)
+
+If you also have an Apple-Silicon Homebrew at /opt/homebrew, ignore it for now—stick to /usr/local to keep things simple.
+
+B) Recreate your project venv so it uses 3.13.7
+
+A venv is pinned to the interpreter it was created with—so rebuild it.
+
+cd /path/to/Trading\ Simulator     # <- your project folder
+deactivate 2>/dev/null || true
+rm -rf .venv
+
+/usr/local/bin/python3 -V          # should print 3.13.7
+/usr/local/bin/python3 -m venv .venv
+source .venv/bin/activate
+
+python -V                          # now 3.13.7
+python -c "import sys; print(sys.executable)"
+
+Original: /Library/Frameworks/Python.framework/Versions/3.13/bin/python3
+New: /usr/local/bin/python3
+
+#################################################
+#Reinstall all requirements
+#################################################
+pip install -r requirements.txt
+
+
+#################################################
+# Add Git to save 
+#################################################
+git add .
+git commit -m "Initial project structure - Skeleton, updated python 13.3.7"
+
+#################################################
+# kill all python scripts
+#################################################
+pgrep -f "python my_script.py"
+ps aux | grep "python my_script.py"
+
+sudo pkill -9 python
+sudo kill -9 25941
+sudo kill -9 26219
+
+sudo pkill python3
+sudo pkill Python
+
+#################################################
+# set the interpreter
+#################################################
+CMD + SHIFT + P
+
+
+#################################################
+# Clear Python caches (so searches don’t hit old names):
+#################################################
+CMD + SHIFT + P
+find . -type d -name "__pycache__" -exec rm -rf {} +
+find . -type f -name "*.pyc" -delete
+
+#################################################
+# Check for processes running
+#################################################
+pgrep -fl python
+lsof -n -i | grep data.alpaca
+
+#################################################
+# Make sure no code still calls the old name:
+#################################################
+grep -R "write_databento_csv" -n src || echo "✅ no references found"
+
+
+#################################################
+# Run the Script in terminal
+#################################################
+
+#Outside Environtment
+export PYTHONPATH="$PWD/src:$PYTHONPATH"
+source scripts/setup_env.sh
+
+#Inside Environtment
+source .venv/bin/activate
+source scripts/setup_env.sh
+
+#################################################
+# DRY RUNS
+#################################################
+
+0) One-time setup in this shell#################################################
+source .venv/bin/activate
+source scripts/setup_env.sh
+
+1) Runner dry-run (sanity)#################################################
+python -m src.modules.orchestration.run_day \
+  --provider alpaca --symbols TSLA,MSFT --date 2025-08-21 --dry-run
+ Expected:
+  
+  --provider alpaca --symbols TSLA,MSFT --date 2025-08-21 --dry-run
+[INFO] ET now: 2025-08-24 01:40:16 EDT
+[PLAN] symbols=['TSLA', 'MSFT'] provider=alpaca out=data/output/alpaca
+  → 09:15 start WS  (label=IEX, channel=trades, ingress=tee)
+  → 09:30 SIP backfill (label=SIP)
+  → 09:45 bridge repair (MERGED)
+
+2) Premarket REST only#################################################
+
+python -m src.modules.datafeeds.alpaca_data premarket \
+  --symbols TSLA --date 2025-08-21 --label SIP
+
+Expect these files:
+./data/output/alpaca/TSLA_2025-08-21_SIP_ohlcv-1s.csv|parquet
+ls ./data/output/alpaca/
+
+3) Stream only — run when there’s actually data#################################################
+
+Pick a market session (Mon–Fri) and run during extended hours or RTH.
+Premarket (earliest chance): after 04:00 ET on a trading day:
+
+python -m src.modules.datafeeds.alpaca_data stream \
+  --symbols TSLA --date "$(date +%F)" \
+  --feed iex --ingress tee --label IEX --channel trades
+
+Regular hours: any time 09:30–16:00 ET:
+python -m src.modules.datafeeds.alpaca_data stream \
+  --symbols TSLA --date "$(date +%F)" --feed iex --ingress tee --label IEX --channel trades
+
+Notes:
+On macOS, $(date -v0d +%F) gives today’s local date; you can also type the date manually (must match ET day for cleaner filenames).
+
+Watch the folder:
+tail -f ./data/output/alpaca/TSLA_<TODAY>_IEX_ohlcv-1s.csv
+
+Stop with Ctrl-C; the script will flush final rows and close Parquet cleanly.
+
+4) End-to-end (MERGED) — do this on a day where you’ll have both SIP and IEX#################################################
+
+To actually produce *_MERGED_*, you need:
+SIP premarket (≤ 09:29:59 ET) for that same date
+IEX stream data (≥ 09:30:00 ET) for that same date
+
+Best way:
+Let the day runner do it on a real trading day.
+If you’re testing outside hours, run runner with --no-wait-92959 (so it doesn’t wait for the SIP delayed minutes), but you still need the IEX file for that date (so run the stream during the session first).
+
+python -m src.modules.orchestration.run_day --provider alpaca --symbols TSLA --date "$(date +%F)" --no-wait-92959
+
+
+Example for Monday (next trading day):
+
+# Start before 09:15 ET and let it self-drive
+python -m src.modules.orchestration.run_day \
+  --provider alpaca --symbols TSLA \
+  --date $(date -v0d +%F)
+
+
+09:15 ET → starts WS
+
+09:30 ET → runs SIP backfill
+
+~09:45 ET (or when SIP includes 09:29:59) → runs repair
+
+Expect: TSLA_<DATE>_MERGED_ohlcv-1s.(csv|parquet)
+
+Quick check:
+
+python - <<'PY'
+import pandas as pd
+p='./data/output/alpaca/TSLA_2025-08-21_MERGED_ohlcv-1s.parquet'  # replace date
+df=pd.read_parquet(p)
+print(df.head()); print(df[df['timestamp'].dt.tz_convert('America/New_York').dt.time.between(pd.to_datetime('09:25:00').time(), pd.to_datetime('09:35:00').time())].head(10))
+PY

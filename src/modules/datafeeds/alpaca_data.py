@@ -16,6 +16,16 @@ from dotenv import load_dotenv
 from modules.datafeeds.common import load_symbols, ensure_out_dir, IngressMode, default_out
 from modules.storage.writers import write_ohlcv_csv, save_parquet_append, parquet_sessions, close_parquet_sessions
 
+
+# --- safe UTC helper (prefer shared util if present) ---
+try:
+    from modules.utils.time import to_utc  # if you created this already
+except Exception:
+    def to_utc(ts):
+        t = pd.Timestamp(ts)
+        return t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+
+
 # --- ACK helpers --------------------------------------------------------------
 def _auth_ok(msg) -> bool:
     """
@@ -122,7 +132,7 @@ def _flush_row(sym: str, date_str: str, outdir: str, label: str, b: Dict[str, An
         })
 
 async def stream_live(symbols: List[str], date_str: str, outdir: str, label: str,
-                      feed: str, ingress: IngressMode, on_bar: Optional[Callable[[Dict[str, Any]], None]] = None, channel: str = "trades", exit_on_interrupt: bool = True):
+                      feed: str, ingress: IngressMode, on_bar: Optional[Callable[[Dict[str, Any]], None]] = None, channel: str = "trades", exit_on_interrupt: bool = True, runner=None):
     """Live trades → 1s bars → disk and/or callback (depending on ingress)."""
     ws_url = WS_SIP_URL if feed.lower() == "sip" else WS_IEX_URL
     bucket: Dict[str, Optional[Dict[str, Any]]] = {}
@@ -171,18 +181,29 @@ async def stream_live(symbols: List[str], date_str: str, outdir: str, label: str
                         print(f"[ALPACA] warning: unexpected subscribe ack: {sub_ack}", flush=True)
                     print(f"[ALPACA] subscribed: {symbols} feed={feed} channel={channel}", flush=True)
 
-                    # 3) MAIN LOOP → aggregate to 1s, write CSV each second, micro-batch Parquet, call on_bar()
+                    # 3) MAIN LOOP → aggregate to 1s, write CSV each second, micro-batch Parquet, call on_bar(), and strategy runner if present
                     while not STOP:
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
                         except asyncio.TimeoutError:
-                            now_sec = pd.Timestamp.utcnow().floor("1s")
+                            now_sec = to_utc(pd.Timestamp.utcnow()).floor("1s")
                             for sym, b in list(bucket.items()):
                                 if b:
-                                    b_ts = pd.to_datetime(b["ts"], utc=True)
+                                    b_ts = to_utc(b["ts"])
                                     if b_ts < now_sec:
                                         _flush_row(sym, date_str, outdir, label, b, ingress, on_bar)
+                                        # --- STRATEGY HOOK ---
+                                        if runner is not None:
+                                            sec_bar = {
+                                                "timestamp": to_utc(b["ts"]),
+                                                "open": b["o"], "high": b["h"], "low": b["l"], "close": b["c"], "volume": b["v"],
+                                                "source": feed.upper(),
+                                            }
+                                            runner.on_second_bar(sym, sec_bar)
                                         bucket[sym] = None
+                            # 👇 Heartbeat: close idle minutes in the runner
+                            if runner is not None:
+                                runner.on_timer_tick()
                             continue
                         except websockets.ConnectionClosedOK:
                             break
@@ -214,13 +235,32 @@ async def stream_live(symbols: List[str], date_str: str, outdir: str, label: str
                                 px  = (bp + ap) / 2.0
                                 sz  = 0.0
                                 ts  = ev.get("t")
-                            ts_ns = pd.to_datetime(ts, utc=True)
+                                # --- STRATEGY QUOTE HOOK ---
+                                if runner is not None and hasattr(runner, "strategy") and hasattr(runner.strategy, "on_quote"):
+                                    q = {
+                                        "bid": bp,
+                                        "ask": ap,
+                                        "bid_size": float(ev.get("bs", 0)),
+                                        "ask_size": float(ev.get("as", 0)),
+                                        "ts": pd.to_datetime(ts, utc=True),
+                                    }
+                                    runner.strategy.on_quote(sym, q)
+                            ts_ns = to_utc(ts)
                             sec = ts_ns.floor("1s")
                             if last_second.get(sym) != sec:
                                 if sym in bucket and bucket[sym]:
                                     _flush_row(sym, date_str, outdir, label, bucket[sym], ingress, on_bar)
+                                    # --- STRATEGY HOOK ---
+                                    if runner is not None:
+                                        b = bucket[sym]
+                                        sec_bar = {
+                                            "timestamp": to_utc(b["ts"]),
+                                            "open": b["o"], "high": b["h"], "low": b["l"], "close": b["c"], "volume": b["v"],
+                                            "source": feed.upper(),
+                                        }
+                                        runner.on_second_bar(sym, sec_bar)
                                 bucket[sym] = {
-                                    "ts": sec.isoformat().replace("+00:00","Z"),
+                                    "ts": sec,  # store as tz-aware Timestamp
                                     "o": px, "h": px, "l": px, "c": px, "v": sz
                                 }
                                 last_second[sym] = sec
@@ -242,6 +282,14 @@ async def stream_live(symbols: List[str], date_str: str, outdir: str, label: str
                             b = bucket.get(sym)
                             if b:
                                 _flush_row(sym, date_str, outdir, label, b, ingress, on_bar)
+                                # --- STRATEGY HOOK ---
+                                if runner is not None:
+                                    sec_bar = {
+                                        "timestamp": to_utc(b["ts"]),
+                                        "open": b["o"], "high": b["h"], "low": b["l"], "close": b["c"], "volume": b["v"],
+                                        "source": feed.upper(),
+                                    }
+                                    runner.on_second_bar(sym, sec_bar)
                                 bucket[sym] = None
                     except Exception as e:
                         print("[ALPACA] flush-on-exit error:", e, flush=True)
@@ -255,6 +303,8 @@ async def stream_live(symbols: List[str], date_str: str, outdir: str, label: str
     finally:
         # flush any buffered rows to Parquet and close writers
         close_parquet_sessions()
+        if runner is not None:
+            runner.stop()
         if exit_on_interrupt and interrupted:
             import sys
             sys.exit(130)
@@ -398,6 +448,8 @@ def main():
     ap_live = _add_common_args(sub.add_parser("stream", help="Stream live trades→1s bars"))
     ap_live.add_argument("--channel", choices=["trades","quotes"], default="trades",
                          help="WebSocket channel to stream (trades or quotes)")
+    ap_live.add_argument("--strategy", help="Strategy class, e.g. modules.strategy.v13:StrategyV13")
+    ap_live.add_argument("--strategy-config", help="Path to JSON/YAML config for the strategy")
 
     args = top.parse_args()
     symbols = load_symbols(args.symbols, args.symbols_file)
@@ -414,7 +466,24 @@ def main():
     if args.cmd == "stream":
         # choose optional callback for direct/tee modes
         on_bar = _on_bar_printer if ingress in (IngressMode.DIRECT, IngressMode.TEE) else None
-        asyncio.run(stream_live(symbols, args.date, outdir, args.label, args.feed, ingress, on_bar, channel=args.channel))
+
+        runner = None
+        if args.strategy:
+            from modules.strategy.config import load_config
+            from modules.strategy.base import StrategyContext
+            from modules.backtest.runner import load_strategy
+            from modules.stream.runner import StreamStrategyRunner
+            strategy_cls = load_strategy(args.strategy)
+            strat = strategy_cls(load_config(args.strategy_config))
+            ctx = StrategyContext(date=args.date, symbols=symbols, config=load_config(args.strategy_config))
+            runner = StreamStrategyRunner(strat, ctx)
+            # NEW: warm-start from canonical files
+            runner.warm_start_from_canonical(date_str=args.date, symbols=symbols,
+                                             minutes=ctx.config.warmup_secs // 60,
+                                             canonical_root="data/output", session="extended")
+            runner.start()
+
+        asyncio.run(stream_live(symbols, args.date, outdir, args.label, args.feed, ingress, on_bar, channel=args.channel, runner=runner))
         return
 
 if __name__ == "__main__":

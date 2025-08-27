@@ -7,3 +7,22 @@ __pycache__/
 .DS_Store
 *.log
 data/output/
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Envs (only if you keep venv inside repo)
+.venv/

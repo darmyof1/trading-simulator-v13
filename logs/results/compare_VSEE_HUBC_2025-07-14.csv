@@ -1,0 +1,7 @@
+run_file,symbol,side,size,partials_qtys,cum_of_original_ok,PnL_$,PnL_R,exit_causes
+StrategyV13_2025-07-14_VSEE_risk,VSEE,SELL_SHORT,324,"[81, 81]",True,2.43,0.05,['EXIT_STOP']
+StrategyV13_2025-07-14_VSEE_risk,VSEE,SELL_SHORT,567,"[142, 142, 283]",True,21.28,0.43,[]
+StrategyV13_2025-07-14_VSEE_risk,VSEE,BUY,348,[87],True,-38.28,-0.77,['EXIT_BIAS']
+VSEE_2025-07-14_risk,VSEE,SELL_SHORT,324,"[81, 81]",True,4.05,0.08,['EXIT_STOP']
+VSEE_2025-07-14_risk,VSEE,SELL_SHORT,567,"[142, 142, 283]",True,21.28,0.43,[]
+VSEE_2025-07-14_risk,VSEE,BUY,348,[87],True,-38.28,-0.77,['EXIT_BIAS']

@@ -1,0 +1,27 @@
+{
+  "date": "2025-07-14",
+  "symbols": [
+    "VSEE"
+  ],
+  "risk_sizing": null,
+  "atr_mult": null,
+  "log": [
+    "[CONFIG] entry_window=09:30-16:00 \u0010 2025-07-14T13:30:00+00:00\u20132025-07-14T20:00:00+00:00",
+    "[SIG] SELL_SHORT | sym=VSEE | ts=2025-07-14T13:33:00+00:00 | close=1.4600 | ema9=1.5304 | ema20=1.5386 | macd=-0.0048 | sig=0.0035 | vwap=1.6432 | atr=0.0441 | entry=1.4600 | stop=1.5481 | R=0.0881 | size=567",
+    "[SIG] EXIT_HA_5M | sym=VSEE | ts=2025-07-14T14:05:00+00:00 | close=1.3300 | fill=1.3300"
+  ],
+  "results": [
+    {
+      "symbol": "VSEE",
+      "side": "SELL_SHORT",
+      "size": 567,
+      "partials_qtys": [],
+      "cum_of_original_ok": true,
+      "PnL_$": 73.71,
+      "PnL_R": 1.48,
+      "exit_causes": [
+        "EXIT_HA_5M"
+      ]
+    }
+  ]
+}

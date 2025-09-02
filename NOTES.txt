@@ -102,6 +102,7 @@ pip install -r requirements.txt
 #################################################
 git add .
 git commit -m "Initial project structure - Skeleton, updated python 13.3.7"
+git commit -m "Project now has strategy and backtest starting to work"
 
 #################################################
 # kill all python scripts
@@ -240,3 +241,10 @@ p='./data/output/alpaca/TSLA_2025-08-21_MERGED_ohlcv-1s.parquet'  # replace date
 df=pd.read_parquet(p)
 print(df.head()); print(df[df['timestamp'].dt.tz_convert('America/New_York').dt.time.between(pd.to_datetime('09:25:00').time(), pd.to_datetime('09:35:00').time())].head(10))
 PY
+
+
+#################################################
+# Compress an entire Folder
+#################################################
+
+zip -r "TradingSimulator.zip" "Trading Simulator" -x "*/.*" -x "__MACOSX/*"

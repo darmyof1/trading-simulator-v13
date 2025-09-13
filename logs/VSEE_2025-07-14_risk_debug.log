@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/Users/rsanchez/Desktop/Command & Control/Finance/Tools/Trading Simulator/src/modules/backtest/runner.py", line 9, in <module>
+    from modules.strategy.base import StrategyBase, StrategyContext
+ModuleNotFoundError: No module named 'modules'

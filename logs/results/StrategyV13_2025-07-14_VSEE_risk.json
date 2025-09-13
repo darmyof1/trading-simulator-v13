@@ -11,28 +11,16 @@
     "[TRACE] sig | long_ok=False short_ok=True vwap_filter=True allow_shorts=True ema9=1.6050 ema20=1.6091 macd=-0.0014 sig=0.0028 vwap=1.6480",
     "[SIG] SELL_SHORT | sym=VSEE | ts=2025-07-14T13:30:02+00:00 | close=1.5600 | ema9=1.6050 | ema20=1.6091 | macd=-0.0014 | sig=0.0028 | vwap=1.6480 | atr=0.0132 | entry=1.5600 | stop=1.7160 | R=0.1560 | size=6410.25641025641",
     "[INFO] STOP_UPDATE | sym=VSEE | ts=2025-07-14T13:30:03+00:00 | from=1.7160 -> 1.6016 | reason=ratchet_4.0%",
-    "[INFO] STOP_UPDATE | sym=VSEE | ts=2025-07-14T13:30:03+00:00 | from=1.7160 -> 1.5682 | reason=trail_atr",
-    "[INFO] STOP_UPDATE | sym=VSEE | ts=2025-07-14T13:30:04+00:00 | from=1.5682 -> 1.5648 | reason=trail_atr",
+    "[INFO] STOP_UPDATE | sym=VSEE | ts=2025-07-14T13:30:04+00:00 | from=1.6016 -> 1.5964 | reason=ratchet_4.0%",
     "[SIG] PARTIAL | sym=VSEE | ts=2025-07-14T13:30:04+00:00 | close=1.5350 | ema9=1.5806 | ema20=1.5961 | macd=-0.0111 | sig=-0.0015 | vwap=1.6476 | atr=0.0149 | level=1 | exit_frac=0.02 | qty=128.25641025641016 | rem=6282.0 | fill=1.5350",
-    "[INFO] STOP_UPDATE | sym=VSEE | ts=2025-07-14T13:30:05+00:00 | from=1.5648 -> 1.5598 | reason=trail_atr",
-    "[INFO] STOP_UPDATE | sym=VSEE | ts=2025-07-14T13:30:08+00:00 | from=1.5598 -> 1.5512 | reason=trail_atr",
-    "[INFO] STOP_UPDATE | sym=VSEE | ts=2025-07-14T13:30:09+00:00 | from=1.5512 -> 1.5440 | reason=trail_atr",
-    "[INFO] STOP_UPDATE | sym=VSEE | ts=2025-07-14T13:30:10+00:00 | from=1.5440 -> 1.5188 | reason=trail_atr",
-    "[SIG] EXIT_STOP | sym=VSEE | ts=2025-07-14T13:30:14+00:00 | close=1.5400 | ema9=1.5375 | ema20=1.5630 | macd=-0.0243 | sig=-0.0165 | vwap=1.6469 | atr=0.0192 | stop=1.5188 | high=1.5400 | fill=1.5400",
-    "[TRACE] sig | long_ok=False short_ok=False vwap_filter=True allow_shorts=True ema9=1.5360 ema20=1.5598 macd=-0.0238 sig=-0.0180 vwap=1.6469",
-    "[TRACE] sig | long_ok=False short_ok=False vwap_filter=True allow_shorts=True ema9=1.5328 ema20=1.5560 macd=-0.0239 sig=-0.0192 vwap=1.6469",
-    "[TRACE] sig | long_ok=False short_ok=False vwap_filter=True allow_shorts=True ema9=1.5322 ema20=1.5535 macd=-0.0229 sig=-0.0199 vwap=1.6468",
-    "[TRACE] sig | long_ok=False short_ok=False vwap_filter=True allow_shorts=True ema9=1.5298 ema20=1.5503 macd=-0.0227 sig=-0.0205 vwap=1.6460",
-    "[TRACE] sig | long_ok=False short_ok=False vwap_filter=True allow_shorts=True ema9=1.5218 ema20=1.5446 macd=-0.0247 sig=-0.0213 vwap=1.6456",
-    "[TRACE] sig | long_ok=False short_ok=False vwap_filter=True allow_shorts=True ema9=1.5135 ema20=1.5384 macd=-0.0267 sig=-0.0224 vwap=1.6456",
-    "[TRACE] sig | long_ok=False short_ok=False vwap_filter=True allow_shorts=True ema9=1.5068 ema20=1.5329 macd=-0.0280 sig=-0.0235 vwap=1.6447",
-    "[TRACE] sig | long_ok=False short_ok=False vwap_filter=True allow_shorts=True ema9=1.5014 ema20=1.5278 macd=-0.0287 sig=-0.0246 vwap=1.6446",
-    "[TRACE] sig | long_ok=False short_ok=False vwap_filter=True allow_shorts=True ema9=1.4951 ema20=1.5223 macd=-0.0297 sig=-0.0256 vwap=1.6446",
-    "[TRACE] sig | long_ok=False short_ok=False vwap_filter=True allow_shorts=True ema9=1.4901 ema20=1.5174 macd=-0.0302 sig=-0.0265 vwap=1.6446",
-    "[TRACE] sig | long_ok=False short_ok=False vwap_filter=True allow_shorts=True ema9=1.4861 ema20=1.5128 macd=-0.0302 sig=-0.0273 vwap=1.6445",
-    "[TRACE] sig | long_ok=False short_ok=False vwap_filter=True allow_shorts=True ema9=1.4829 ema20=1.5088 macd=-0.0299 sig=-0.0278 vwap=1.6444",
-    "[TRACE] sig | long_ok=False short_ok=False vwap_filter=True allow_shorts=True ema9=1.4823 ema20=1.5060 macd=-0.0285 sig=-0.0279 vwap=1.6443",
-    "[TRACE] sig | long_ok=False short_ok=False vwap_filter=True allow_shorts=True ema9=1.4858 ema20=1.5054 macd=-0.0255 sig=-0.0274 vwap=1.6442",
+    "[INFO] STOP_UPDATE | sym=VSEE | ts=2025-07-14T13:30:05+00:00 | from=1.5964 -> 1.5912 | reason=ratchet_4.0%",
+    "[INFO] STOP_UPDATE | sym=VSEE | ts=2025-07-14T13:30:08+00:00 | from=1.5912 -> 1.5860 | reason=ratchet_4.0%",
+    "[INFO] STOP_UPDATE | sym=VSEE | ts=2025-07-14T13:30:09+00:00 | from=1.5860 -> 1.5808 | reason=ratchet_4.0%",
+    "[INFO] STOP_UPDATE | sym=VSEE | ts=2025-07-14T13:30:10+00:00 | from=1.5808 -> 1.5496 | reason=ratchet_4.0%",
+    "[INFO] STOP_UPDATE | sym=VSEE | ts=2025-07-14T13:30:55+00:00 | from=1.5496 -> 1.5392 | reason=ratchet_4.0%",
+    "[INFO] RATCHET | sym=VSEE | ts=2025-07-14T13:30:55+00:00 | stop=1.4949 | cushion_pct=4.17",
+    "[SIG] PARTIAL | sym=VSEE | ts=2025-07-14T13:30:55+00:00 | close=1.4800 | ema9=1.5135 | ema20=1.5384 | macd=-0.0267 | sig=-0.0224 | vwap=1.6456 | atr=0.0162 | level=2 | exit_frac=0.1 | qty=641.0 | rem=5641.0 | fill=1.4800",
+    "[SIG] EXIT_STOP | sym=VSEE | ts=2025-07-14T13:31:05+00:00 | close=1.5000 | ema9=1.4858 | ema20=1.5054 | macd=-0.0255 | sig=-0.0274 | vwap=1.6442 | atr=0.0096 | stop=1.4949 | high=1.5000 | fill=1.5000",
     "[TRACE] sig | long_ok=False short_ok=False vwap_filter=True allow_shorts=True ema9=1.4907 ema20=1.5059 macd=-0.0220 sig=-0.0264 vwap=1.6442",
     "[TRACE] sig | long_ok=False short_ok=False vwap_filter=True allow_shorts=True ema9=1.4965 ema20=1.5072 macd=-0.0183 sig=-0.0247 vwap=1.6440",
     "[TRACE] sig | long_ok=False short_ok=False vwap_filter=True allow_shorts=True ema9=1.4982 ema20=1.5070 macd=-0.0163 sig=-0.0231 vwap=1.6438",
@@ -255,11 +243,12 @@
       "side": "SELL_SHORT",
       "size": 6410,
       "partials_qtys": [
-        128
+        128,
+        641
       ],
       "cum_of_original_ok": true,
-      "PnL_$": 128.84,
-      "PnL_R": 0.13,
+      "PnL_$": 392.94,
+      "PnL_R": 0.39,
       "exit_causes": [
         "EXIT_STOP"
       ]
@@ -271,11 +260,12 @@
       "side": "SELL_SHORT",
       "size": 6410,
       "partials_qtys": [
-        128
+        128,
+        641
       ],
       "cum_of_original_ok": true,
-      "PnL_$": 128.84,
-      "PnL_R": 0.13,
+      "PnL_$": 392.94,
+      "PnL_R": 0.39,
       "exit_causes": [
         "EXIT_STOP"
       ]
@@ -283,7 +273,7 @@
   ],
   "summary": {
     "trades": 1,
-    "total_PnL_$": 128.84,
-    "avg_PnL_R": 0.13
+    "total_PnL_$": 392.94,
+    "avg_PnL_R": 0.39
   }
 }

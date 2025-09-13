@@ -510,17 +510,23 @@ class StrategyV13(StrategyBase):
 
     # --- Break-even with min-minutes gate ---
     def _maybe_activate_be(self, symbol: str, s: dict, ts) -> None:
-        cfg = getattr(self.cfg, "be", {}) or {}
-        min_m = float(cfg.get("min_minutes", 0))
-        need_partials = int(getattr(self.cfg, "be_after_partials", 0))
-        if s.get("be_active"):
+        # New logic: BOTH min_minutes and partials_taken must be satisfied before BE activates
+        cfg = self.cfg_d.get("be", {}) or {}
+        be_minutes = int(cfg.get("min_minutes", 0))
+        need_partials = int(self.cfg_d.get("be_after_partials", 0))
+
+        # Calculate minutes in position
+        pos_open_ts = s.get("entered_at")
+        if not pos_open_ts:
             return
-        if s.get("partials_done", 0) < need_partials:
-            return
-        if self._elapsed_minutes(s, ts) + 1e-9 < min_m:
-            return
-        s["be_active"] = True
-        self._log(f"[INFO] BE Activated | sym={symbol} | ts={pd.Timestamp(ts).isoformat()} | after_partials={s.get('partials_done',0)} | minutes={self._elapsed_minutes(s, ts):.1f}")
+        minutes_in_pos = (self._as_utc(ts) - self._as_utc(pos_open_ts)).total_seconds() / 60.0
+        partials_taken = s.get("took_partial", 0)
+
+        be_ready = (minutes_in_pos >= be_minutes) and (partials_taken >= need_partials)
+        if not s.get("be_active") and be_ready:
+            s["be_active"] = True
+            s["stop"] = s["entry"]
+            self._log(f"[INFO] BE Activated | sym={symbol} | ts={pd.Timestamp(ts).isoformat()} | after_partials={partials_taken} | minutes={minutes_in_pos:.1f}")
 
     # --- Step-ratchet (entry-anchored) ---
     def _apply_ratchet(self, symbol: str, s: dict, price: float, ts) -> None:
@@ -778,39 +784,39 @@ class StrategyV13(StrategyBase):
         self.results_dump_path = self.cfg_d.get("results_dump_path", getattr(self, "results_dump_path", "./logs/results"))
         self.results_run_label = self.cfg_d.get("results_run_label", getattr(self, "results_run_label", "run"))
 
-    # Load tier-specific stop percent mapping if present
-    self.fixed_sl_by_tier = dict(self.cfg_d.get("fixed_sl_pct_by_tier", {}))
+        # Load tier-specific stop percent mapping if present
+        self.fixed_sl_by_tier = dict(self.cfg_d.get("fixed_sl_pct_by_tier", {}))
 
-    # pull from JSON (no hard-coded window here)
-    self.entry_window_spec = self.cfg_d.get("entry_window", None)
-    self.tz_name = self.cfg_d.get("timezone", "US/Eastern")
+        # pull from JSON (no hard-coded window here)
+        self.entry_window_spec = self.cfg_d.get("entry_window", None)
+        self.tz_name = self.cfg_d.get("timezone", "US/Eastern")
 
-    # one-time helpers/containers
-    self.ha5m = HA5m()
-    self.buffers = {}
-    self.state = {}
+        # one-time helpers/containers
+        self.ha5m = HA5m()
+        self.buffers = {}
+        self.state = {}
 
-    # --- entry window UTC bounds (once per run) ---
-    self.entry_start_utc, self.entry_end_utc = None, None
-    if self.date:
-        ew = self._resolve_entry_window(self.date)
-        if ew:
-            self.entry_start_utc, self.entry_end_utc = ew
-            self._log(f"[CONFIG] entry_window={self.entry_window_spec}   "
-                    f"{self.entry_start_utc.isoformat()} {self.entry_end_utc.isoformat()}")
-        else:
-            self._log("[CONFIG] entry_window=None (no restriction)")
+        # --- entry window UTC bounds (once per run) ---
+        self.entry_start_utc, self.entry_end_utc = None, None
+        if self.date:
+            ew = self._resolve_entry_window(self.date)
+            if ew:
+                self.entry_start_utc, self.entry_end_utc = ew
+                self._log(f"[CONFIG] entry_window={self.entry_window_spec}   "
+                        f"{self.entry_start_utc.isoformat()} {self.entry_end_utc.isoformat()}")
+            else:
+                self._log("[CONFIG] entry_window=None (no restriction)")
 
-    # Initialize buffers/state for the symbols we're going to trade
-    for sym in self.symbols:
-        self.buffers[sym] = pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
-        self.state[sym] = {
-            "pos": 0, "entry": None, "stop": None, "r": None,
-            "size": 0, "orig_size": 0, "took_partial": 0, "be_active": False,
-            "allow_reentry_long": False, "allow_reentry_short": False,
-            "entries_long": 0, "entries_short": 0,
-        }
-    print(f"[StrategyV13] start date={self.date} symbols={self.symbols}")
+        # Initialize buffers/state for the symbols we're going to trade
+        for sym in self.symbols:
+            self.buffers[sym] = pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+            self.state[sym] = {
+                "pos": 0, "entry": None, "stop": None, "r": None,
+                "size": 0, "orig_size": 0, "took_partial": 0, "be_active": False,
+                "allow_reentry_long": False, "allow_reentry_short": False,
+                "entries_long": 0, "entries_short": 0,
+            }
+        print(f"[StrategyV13] start date={self.date} symbols={self.symbols}")
 
     def on_bar(self, symbol: str, bar: Bar) -> Optional[Iterable[Dict[str, Any]]]:
 
@@ -951,7 +957,18 @@ class StrategyV13(StrategyBase):
 
                 if long_ok and can_long:
                     entry = close
-                    stop  = self._initial_stop(entry, atrv, direction=+1)
+                    # --- Tier-aware stop-loss logic ---
+                    tier = getattr(self, "_last_entry_tier", "A")  # set by your signal code
+                    sl_mode = self.cfg_d.get("stop_mode", "fixed")
+                    if sl_mode == "tier_map":
+                        sl_pct = float(self.cfg_d.get("tier_sl_pct", {}).get(tier, self.cfg_d.get("fixed_sl_pct", 0.10)))
+                    elif sl_mode == "fixed":
+                        sl_pct = float(self.cfg_d.get("fixed_sl_pct", 0.10))
+                    else:
+                        # (optional) ATR path if you support it elsewhere
+                        sl_pct = float(self.cfg_d.get("fixed_sl_pct", 0.10))
+
+                    stop = entry * (1.0 - sl_pct)
                     r     = max(1e-9, entry - stop)
                     # Decide sizing tier for this entry
                     self._last_entry_tier = "A"   # cross-based long = Tier A
@@ -971,7 +988,18 @@ class StrategyV13(StrategyBase):
 
                 if short_ok and can_short:
                     entry = close
-                    stop  = self._initial_stop(entry, atrv, direction=-1)
+                    # --- Tier-aware stop-loss logic ---
+                    tier = getattr(self, "_last_entry_tier", "A")  # set by your signal code
+                    sl_mode = self.cfg_d.get("stop_mode", "fixed")
+                    if sl_mode == "tier_map":
+                        sl_pct = float(self.cfg_d.get("tier_sl_pct", {}).get(tier, self.cfg_d.get("fixed_sl_pct", 0.10)))
+                    elif sl_mode == "fixed":
+                        sl_pct = float(self.cfg_d.get("fixed_sl_pct", 0.10))
+                    else:
+                        # (optional) ATR path if you support it elsewhere
+                        sl_pct = float(self.cfg_d.get("fixed_sl_pct", 0.10))
+
+                    stop = entry * (1.0 + sl_pct)
                     r     = max(1e-9, stop - entry)
                     # Decide sizing tier for this entry
                     self._last_entry_tier = "A"   # cross-based short = Tier A

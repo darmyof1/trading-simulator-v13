@@ -1,4 +1,7 @@
 {
+  "stop_mode": "tier_map",
+  "tier_sl_pct": { "A": 0.10, "B": 0.05 },
+  "fixed_sl_pct": 0.10,
   "entry_tiers": ["A"],
   "tier_b": { "enabled": false, "min_age_bars": 30, "max_age_bars": 240 },
   "use_risk_sizing": true,
@@ -45,8 +48,6 @@
   "max_size": 1000,
   "lot_size": 1,
 
-  "stop_mode": "fixed",
-  "fixed_sl_pct": 0.10,
   "fixed_sl_pct_by_tier": { "A": 0.10, "B": 0.05 },
   "atr_mult": 2.0,
 
@@ -56,7 +57,7 @@
   "allow_shorts": true,
 
 
-  "be": { "min_minutes": 0 },
+  "be": { "min_minutes": 2 },
 
   "ratchet": {
     "enable": true,

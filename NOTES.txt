@@ -104,6 +104,9 @@ git add .
 git commit -m "Initial project structure - Skeleton, updated python 13.3.7"
 git commit -m "Project now has strategy and backtest starting to work"
 
+git checkout -b fix/v13-intrabar-stops-partials-vwap-logging
+
+
 #################################################
 # kill all python scripts
 #################################################

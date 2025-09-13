@@ -5,7 +5,7 @@ import json
 import signal
 import asyncio
 import argparse
-from typing import Callable, Optional, List, Dict, Any
+from typing import Callable, Iterator, Optional, List, Dict, Any
 import pandas as pd
 import websockets
 from time import monotonic
@@ -15,18 +15,54 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from modules.datafeeds.common import load_symbols, ensure_out_dir, IngressMode, default_out
 from modules.storage.writers import write_ohlcv_csv, save_parquet_append, parquet_sessions, close_parquet_sessions
+from modules.utils.time import to_utc
 
+# === Alpaca Data API enpoints (WebSocket and REST URLs) ===
+# First checking for environment variables and then falling back to default values.
+DATA_BASE = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets/v2")
+WS_BASE   = os.getenv("ALPACA_STREAM_BASE_URL", "wss://stream.data.alpaca.markets/v2")
 
-# --- safe UTC helper (prefer shared util if present) ---
-try:
-    from modules.utils.time import to_utc  # if you created this already
-except Exception:
-    def to_utc(ts):
-        t = pd.Timestamp(ts)
-        return t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+# WebSocket (live only) data endpoints (IEX and SIP feeds)
+WS_IEX_URL = f"{WS_BASE}/iex"
+WS_SIP_URL = f"{WS_BASE}/sip" #not in use
 
+# REST (historical) data endpoints
+# the current pipeline only hits /stocks/trades
+# and then resamples to 1-second (and later to 1-minute).
+# It does not call /stocks/bars.
 
-# --- ACK helpers --------------------------------------------------------------
+REST_TRADES_URL = f"{DATA_BASE}/stocks/trades"
+REST_BARS_URL   = f"{DATA_BASE}/stocks/bars" # not in use
+
+    
+# === Alpaca WebSocket message types ===
+STOP = False
+#=== Variables for Parquet buffering ===
+#from collections import defaultdict
+_PARQ_BUFFERS = defaultdict(list)        # per-symbol row buffers
+_PARQ_LAST_TS = defaultdict(lambda: 0.0) # per-symbol last flush time (monotonic seconds)
+PARQ_FLUSH_SECS = 5.0                    # or 10.0; tune as you like
+PARQ_FLUSH_ROWS = 100    
+
+# Load environment variables from .env file
+# load_dotenv(find_dotenv(), override=False)
+load_dotenv()
+
+# Function to get API keys from environment variables
+def _get_keys():
+    key_id = os.getenv("ALPACA_API_KEY_ID") or os.getenv("APCA_API_KEY_ID")
+    secret = os.getenv("ALPACA_API_SECRET") or os.getenv("APCA_API_SECRET_KEY")
+    if not key_id or not secret:
+        raise RuntimeError(
+            "Missing Alpaca credentials. Please set ALPACA_API_KEY_ID and ALPACA_API_SECRET "
+            "(or APCA_API_KEY_ID / APCA_API_SECRET_KEY)."
+        )
+    return key_id, secret
+
+# Retrieve and print the API keys for verification
+key_id, secret = _get_keys()
+keys = _get_keys()
+
 def _auth_ok(msg) -> bool:
     """
     Accept both old and new Alpaca WS shapes, and arrays of messages.
@@ -66,31 +102,13 @@ def _sub_ok(msg) -> bool:
         return True
     return False
 
-_PARQ_BUFFERS = defaultdict(list)        # per-symbol row buffers
-_PARQ_LAST_TS = defaultdict(lambda: 0.0) # per-symbol last flush time (monotonic seconds)
-PARQ_FLUSH_SECS = 5.0                    # or 10.0; tune as you like
-PARQ_FLUSH_ROWS = 100                    # safety: also flush if we accumulate this many rows
-
-def _get_keys():
-    key_id = os.getenv("ALPACA_API_KEY_ID") or os.getenv("APCA_API_KEY_ID")
-    secret = os.getenv("ALPACA_API_SECRET") or os.getenv("APCA_API_SECRET_KEY")
-    return key_id, secret
-
-# Load environment variables from .env file
-load_dotenv()
-# WebSocket URLs for Alpaca IEX and SIP feeds
-WS_IEX_URL = "wss://stream.data.alpaca.markets/v2/iex"
-WS_SIP_URL = "wss://stream.data.alpaca.markets/v2/sip"
-STOP = False
-
-def _env(name: str, default: str = "") -> str:
-    return os.environ.get(name, default)
-
-def _backoff():
-    delay = 1.0
+def _backoff(initial: float = 1.0, factor: float = 2.0, max_delay: float = 30.0) -> Iterator[float]:
+    """Exponential backoff generator: 1, 2, 4, 8, ... capped at max_delay."""
+    #from typing import Iterator
+    delay = initial
     while True:
         yield delay
-        delay = min(delay * 2, 30.0)
+        delay = min(delay * factor, max_delay)
 
 def _flush_row(sym: str, date_str: str, outdir: str, label: str, b: Dict[str, Any], ingress: IngressMode,
                on_bar: Optional[Callable[[Dict[str, Any]], None]]) -> None:
@@ -130,6 +148,14 @@ def _flush_row(sym: str, date_str: str, outdir: str, label: str, b: Dict[str, An
             "open": b["o"], "high": b["h"], "low": b["l"], "close": b["c"], "volume": b["v"],
             "source": label
         })
+
+def _et_window(date_str: str):
+    et = ZoneInfo("America/New_York")
+    day = pd.Timestamp(f"{date_str} 00:00:00", tz=et)
+    start_et = day + pd.Timedelta(hours=4)                   # 04:00
+    bridge_et = day + pd.Timedelta(hours=9, minutes=15)      # 09:15
+    end_et = day + pd.Timedelta(hours=9, minutes=30)         # 09:30 (not used here)
+    return start_et, bridge_et, end_et        
 
 async def stream_live(symbols: List[str], date_str: str, outdir: str, label: str,
                       feed: str, ingress: IngressMode, on_bar: Optional[Callable[[Dict[str, Any]], None]] = None, channel: str = "trades", exit_on_interrupt: bool = True, runner=None):
@@ -309,15 +335,6 @@ async def stream_live(symbols: List[str], date_str: str, outdir: str, label: str
             import sys
             sys.exit(130)
 
-
-def _et_window(date_str: str):
-    et = ZoneInfo("America/New_York")
-    day = pd.Timestamp(f"{date_str} 00:00:00", tz=et)
-    start_et = day + pd.Timedelta(hours=4)                   # 04:00
-    bridge_et = day + pd.Timedelta(hours=9, minutes=15)      # 09:15
-    end_et = day + pd.Timedelta(hours=9, minutes=30)         # 09:30 (not used here)
-    return start_et, bridge_et, end_et
-
 def _fetch_trades_rest(symbols, start_iso, end_iso, feed, key_id, secret):
     headers = {
         "APCA-API-KEY-ID": key_id,
@@ -331,7 +348,7 @@ def _fetch_trades_rest(symbols, start_iso, end_iso, feed, key_id, secret):
         "limit": 10_000,
         "feed": feed,
     }
-    url = "https://data.alpaca.markets/v2/stocks/trades"
+
     out = []
     next_token = None
     with requests.Session() as s:
@@ -339,7 +356,7 @@ def _fetch_trades_rest(symbols, start_iso, end_iso, feed, key_id, secret):
             p = params.copy()
             if next_token:
                 p["page_token"] = next_token
-            r = s.get(url, headers=headers, params=p, timeout=30)
+            r = s.get(REST_TRADES_URL, headers=headers, params=p, timeout=30)
             r.raise_for_status()
             data = r.json()
             payload = data.get("trades", {})

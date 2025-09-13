@@ -30,6 +30,8 @@ class StrategyConfig:
     warmup_secs: int = 12_000
     debug_signals: bool = True
     base_size: int = 4  # use 4 to mirror the old 1,1,2 partial behavior
+    ratchet_pct_short: float = 4.0
+    ratchet_pct_long: float = 4.0
 
     # === NEW fields ===
     # Stops

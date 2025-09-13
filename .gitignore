@@ -1,28 +1,20 @@
-# Git ignore file for excluding unnecessary files
-.venv/
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.DS_Store
-*.log
-data/output/
-# Python bytecode / caches
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
-
-# Tool caches
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.ipynb_checkpoints/
-
-# Build artifacts
-build/
-dist/
 *.egg-info/
 .eggs/
+.dist/
+build/
+*.pyo
+*.pyd
 
-# Envs (only if you keep venv inside repo)
+# Env / OS
 .venv/
+.env
+.DS_Store
+
+# Project outputs
+logs/
+sv.log
+data/output/
+data/input/

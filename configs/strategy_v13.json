@@ -1,20 +1,53 @@
 {
+  "entry_tiers": ["A"],
+  "tier_b": { "enabled": false, "min_age_bars": 30, "max_age_bars": 240 },
+  "use_risk_sizing": true,
+  "risk_rules": {
+    "risk_model": "percent_of_balance",
+    "account_balance": 100000,
+    "risk_pct_of_balance": 0.002,
+    "max_dollars_risk": 250,
+    "size_by_tier": { "A": "highProbSize", "B": "lateTrendSize" },
+    "highProbSize": 1.0,
+    "lateTrendSize": 0.6,
+    "lowProbSize": 0.3
+  },
+  "tiers": {
+  "enable": ["A", "B"],
+    "B_rules": {
+      "min_minutes_since_cross": 5,
+      "pullback_pct": 0.5,
+      "max_chase_pct": 0.2
+    }
+  },
+  "entry_window": { "start": "09:30", "end": "13:15" },
   "timezone": "US/Eastern",
-  "entry_window": "09:30-16:00",
+  "trace_every_n": 5,
+  "SIZE_MODE": "auto",
+  "highProbSize": 0.02,
+  "lowProbSize": 0.01,
+  "lateTrendSize": 0.015,
+  "USE_DYNAMIC_CASH": true,
+  "EQUITY": 25000,
+  "MIN_TRADE_AMOUNT": 500,
+  "alpaca_dir": "./data/output/alpaca",
+  "bridge_boundary": "09:15:00",
+  
   "exits": {
     "enable_ha_5m": true
   },
   "results_dump_path": "logs/results/",
   "results_run_label": "risk",
   "debug_signals": true,
-  "use_risk_sizing": true,
-  "account_balance": 25000.0,
-  "risk_pct_of_balance": 0.002,
+  
+  
   "min_size": 1,
   "max_size": 1000,
   "lot_size": 1,
 
-  "stop_mode": "atr",
+  "stop_mode": "fixed",
+  "fixed_sl_pct": 0.10,
+  "fixed_sl_pct_by_tier": { "A": 0.10, "B": 0.05 },
   "atr_mult": 2.0,
 
   "base_size": 4,
@@ -23,9 +56,7 @@
   "allow_shorts": true,
 
 
-  "be": {
-    "min_minutes": 5
-  },
+  "be": { "min_minutes": 0 },
 
   "ratchet": {
     "enable": true,
@@ -35,12 +66,7 @@
     ]
   },
 
-  "ha_exit": {
-    "enable": true,
-    "timeframe_min": 5,
-    "min_profit_pct": 0.00,
-    "require_profit": true
-  },
+  "ha_exit": { "enable": true, "timeframe_min": 5, "min_profit_pct": 0.0, "require_profit": true },
 
   "partial_levels": [
     { "move_pct": 0.02, "exit_fraction": 0.02 },
@@ -48,7 +74,7 @@
     { "move_pct": 0.10, "exit_fraction": 0.10 }
   ],
   "partial_one_per_bar": true,
-  "be_after_partials": 1,
+  "be_after_partials": 2,
 
   "max_trades_per_dir": 1,
   "allow_reentry_after_be": true,

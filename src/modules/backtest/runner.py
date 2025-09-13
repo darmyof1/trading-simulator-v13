@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Tuple, Optional
 import pandas as pd
 
-from modules.strategy.base import StrategyBase, StrategyContext
-from modules.strategy.config import load_config, StrategyConfig
-from modules.datafeeds.common import load_symbols  # you already have this helper
+from src.modules.strategy.base import StrategyBase, StrategyContext
+from src.modules.strategy.config import load_config, StrategyConfig
+from src.modules.datafeeds.common import load_symbols  # you already have this helper
 
 CANON = ["timestamp", "open", "high", "low", "close", "volume"]
 
@@ -72,14 +72,13 @@ def to_utc(ts) -> pd.Timestamp:
 
 # ---------- strategy loader ----------------------------------------------------
 
-def load_strategy(class_path: str) -> StrategyBase:
-    """
-    class_path like 'modules.strategy.v13:StrategyV13'
-    """
-    mod_name, cls_name = class_path.split(":")
-    mod = importlib.import_module(mod_name)
-    cls = getattr(mod, cls_name)
-    return cls  # caller will instantiate with (config)
+def load_strategy(spec: str):
+    mod_name, _, cls_name = spec.partition(":")
+    try:
+        mod = importlib.import_module(mod_name)
+    except ModuleNotFoundError:
+        mod = importlib.import_module(f"src.{mod_name}")
+    return getattr(mod, cls_name)
 
 # ---------- main backtest loop -------------------------------------------------
 
@@ -116,11 +115,17 @@ def run_backtest(
 
             # Optionally pull warmup from previous day (simplest version: use same day's early bars)
             warmup_rows = warmup_mins if timeframe == "1m" else warmup_mins * 60
+
             wdf, run_df = warmup_concat(df.iloc[:-1], df, warmup_rows)  # crude "history" = earlier same-day
             # Seed: feed warmup silently
             for _, row in wdf.iterrows():
                 bar = row_to_bar(row)
                 strat.on_bar(sym, bar)
+
+            # Avoid double-processing: drop any bars <= last warmup ts
+            if not wdf.empty:
+                cut_ts = wdf["timestamp"].max()
+                run_df = run_df[run_df["timestamp"] > cut_ts]
 
             per_symbol_frames[sym] = run_df
 

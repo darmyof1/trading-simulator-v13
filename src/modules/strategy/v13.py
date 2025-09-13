@@ -1,20 +1,48 @@
-
-# ---------- END TOP-LEVEL ----------
 from __future__ import annotations
-from typing import Dict, Any, Iterable, Optional, List
+from datetime import datetime, timezone, timedelta
 import pandas as pd
-import math
-from dataclasses import asdict, is_dataclass
-from types import SimpleNamespace
+import logging
+from src.modules.strategy.base import StrategyBase, StrategyContext
+from src.modules.strategy.config import StrategyConfig
+from src.modules.indicators.indicators import ma_bundle, macd, atr, vwap
+
+
+from typing import Dict, Any, Iterable, Optional, List, Tuple
+
+import pandas as pd
 import numpy as np
-from zoneinfo import ZoneInfo
-from pathlib import Path
+
 import json
 import os
+import re
+import math
+from pathlib import Path
+from zoneinfo import ZoneInfo
+import pytz
 
-# === add near other imports ===
+from dataclasses import asdict, is_dataclass
+from types import SimpleNamespace
 from datetime import datetime, timedelta
-from typing import Optional, Tuple
+
+from src.modules.strategy.base import StrategyBase, StrategyContext
+from src.modules.strategy.config import StrategyConfig
+from src.modules.indicators.indicators import ma_bundle, macd, atr, vwap
+# --- logger shim so self._log can be called or have .info/.debug ---
+class _LoggerShim:
+    def __init__(self, sink=None):
+        # sink should be a callable like print(msg) or logger.info(msg)
+        self._sink = sink or print
+
+    def __call__(self, *args, **kwargs):
+        # allow self._log("...") style
+        msg = " ".join(str(a) for a in args)
+        self._sink(msg)
+
+    # allow self._log.info("..."), .debug("..."), etc.
+    def info(self, *args, **kwargs):  self(*args, **kwargs)
+    def debug(self, *args, **kwargs): self(*args, **kwargs)
+    def warning(self, *args, **kwargs): self(*args, **kwargs)
+    def error(self, *args, **kwargs): self(*args, **kwargs)
 
 # === add somewhere above your main loop / class or in Strategy class body ===
 class HA5m:
@@ -103,16 +131,14 @@ def _is_profit_tighter(side: str, prev_stop: float, new_stop: float, entry: floa
     # SHORT side:
     return new_stop < prev_stop
 
-from modules.strategy.base import StrategyBase, StrategyContext
-from modules.strategy.config import StrategyConfig
-from modules.indicators.indicators import ma_bundle, macd, atr, vwap
+
 # ---------- TOP-LEVEL, OUTSIDE THE CLASS ----------
 def parse_sig_loglines_to_trades(log_lines):
     """
     Pure function. Parses [SIG] lines -> list of trade dicts.
     Always returns a list (possibly empty).
     """
-    import math
+    
 
     def parse_line(line: str):
         line = line.strip()
@@ -269,58 +295,212 @@ Bar = Dict[str, Any]
 
 class StrategyV13(StrategyBase):
 
-    def _set_stop(self, side: str, sym: str, ts, close_px: float,
-                  new_stop: float, entry_px: float, prev_stop: Optional[float],
-                  reason: Optional[str] = None):
+    import logging
+
+    def _compute_position_size(self, entry: float, stop: float, direction: int) -> float:
         """
-        Call this instead of direct assignments to stop_long/stop_short.
-        It logs [INFO] BE when new_stop == entry_px and it tightened vs previous,
-        otherwise [INFO] RATCHET when it tightened in profit direction.
-        Returns new_stop (so you can assign).
+        Return number of shares to buy/sell for this entry price, matching the old v13 behavior:
+        - Fractional sizing by tier (A: highProbSize, B: lateTrendSize)
+        - Dynamic cash if enabled, else EQUITY
+        - Min notional guard
+        NOTE: We keep it independent of symbol; tier is read from a class attribute if available.
         """
-        event = None
-        if new_stop is None:
-            return new_stop
+        cfg = getattr(self, "cfg_d", {}) or {}
 
-        # breakeven?
-        if abs(new_stop - entry_px) < 1e-10 and _is_profit_tighter(side, prev_stop, new_stop, entry_px):
-            event = "BE"
-        elif _is_profit_tighter(side, prev_stop, new_stop, entry_px):
-            event = "RATCHET"
+        # --- sizing params (fall back to old-script defaults) ---
+        size_mode      = cfg.get("SIZE_MODE", cfg.get("size_mode", "auto"))
+        highProbSize   = float(cfg.get("highProbSize", 0.050))   # 5%
+        lowProbSize    = float(cfg.get("lowProbSize",  0.025))   # 2.5%
+        lateTrendSize  = float(cfg.get("lateTrendSize", lowProbSize))
+        use_dyn_cash   = bool(cfg.get("USE_DYNAMIC_CASH", True))
+        equity         = float(cfg.get("EQUITY", 200_000.0))
+        min_notional   = float(cfg.get("MIN_TRADE_AMOUNT", 1_000.0))
 
-        if event:
-            msg = (f"[INFO] {event} | sym={sym} | ts={_fmt_ts(ts)} | "
-                   f"prev={prev_stop:.4f} | new={new_stop:.4f} | fill={close_px:.4f}")
-            if reason:
-                msg += f" | why={reason}"
-            self._log(msg)  # use your same append path as [SIG]
+        # Try to detect the current entry tier that the signal logic computed.
+        # If the strategy sets one of these during signal evaluation, we’ll use it.
+        tier = getattr(self, "_last_entry_tier", None)
+        if tier is None:
+            tier = getattr(self, "_last_tier", None)
 
-        return new_stop
+        # --- choose fraction by mode/tier (old v13 rules) ---
+        if size_mode == "auto":
+            if tier == "B":
+                size_frac = lateTrendSize
+            else:
+                # default to A if unknown (old script biases to 'A' at open)
+                size_frac = highProbSize
+        elif size_mode == "high":
+            size_frac = highProbSize
+        else:  # "low"
+            size_frac = lowProbSize
+
+        # --- capital base ---
+        base_cap = None
+        if use_dyn_cash:
+            # prefer a runtime cash field if the runner sets one
+            for attr in ("available_cash", "cash", "current_balance"):
+                val = getattr(self, attr, None)
+                if isinstance(val, (int, float)):
+                    base_cap = float(val)
+                    break
+            if base_cap is None and getattr(self, "ctx", None) is not None:
+                base_cap = getattr(self.ctx, "available_cash", None) or getattr(self.ctx, "cash", None)
+                if isinstance(base_cap, (int, float)):
+                    base_cap = float(base_cap)
+
+        if base_cap is None:
+            base_cap = equity  # fallback to fixed equity
+
+        trade_amount = base_cap * size_frac
+
+        # Min-notional guard (only meaningful with dynamic cash)
+        if use_dyn_cash and trade_amount < min_notional:
+            # 0 shares → caller will treat as "skip entry" or simply not place an order
+            return 0.0
+
+        if entry is None or entry <= 0:
+            # Defensive: if no valid price, do not size
+            return 0.0
+
+        # Old script allowed fractional shares in the sim; keep that behavior.
+        shares = trade_amount / float(entry)
+        return float(shares)
     # --- time helpers ---
     def _as_utc(self, ts):
-        t = pd.Timestamp(ts)
+        """
+        Normalize any timestamp-like value (string, datetime, pandas Timestamp)
+        to a tz-aware pandas Timestamp in UTC.
+        """
+        t = pd.Timestamp(ts) if ts is not None else pd.Timestamp.now(tz="UTC")
         if t.tzinfo is None:
             t = t.tz_localize("UTC")
         else:
             t = t.tz_convert("UTC")
         return t
 
-    def _in_entry_window(self, ts) -> bool:
-        ew = getattr(self.cfg, "entry_window", None) or {}
-        if not ew or not ew.get("enable", False):
-            return True
-        tz = ZoneInfo(ew.get("timezone", "America/New_York"))
-        t = self._as_utc(ts).tz_convert(tz)
-        start = pd.to_datetime(ew.get("start", "09:30")).time()
-        end   = pd.to_datetime(ew.get("end",   "10:00")).time()
-        return start <= t.time() <= end
+    def _set_now(self, ts):
+        try:
+            self._last_ts = pd.Timestamp(ts) if ts is not None else None
+        except Exception:
+            self._last_ts = None
 
-    # --- PnL / elapsed helpers ---
-    def _profit_pct(self, s: dict, price: float) -> float:
-        if s["side"] == "BUY":
-            return (price / s["entry"]) - 1.0
-        else:
-            return (s["entry"] / price) - 1.0
+    def _now_iso(self) -> str:
+        """
+        Return an ISO timestamp for logging. Prefer the most recent bar timestamp if we have it,
+        otherwise fall back to current UTC time.
+        """
+        for name in ("_last_ts", "last_ts", "_last_bar_ts", "bar_ts", "_ts", "ts"):
+            ts = getattr(self, name, None)
+            if ts is not None:
+                try:
+                    return ts.isoformat()
+                except Exception:
+                    return str(ts)
+        return datetime.now(timezone.utc).isoformat()
+
+        if s["pos"] == -1:
+            entry = float(s["entry"]); stop = float(s["stop"])
+
+            # HA(5m) exit precedence
+            if self._maybe_exit_ha(symbol, s, last):
+                out.append({"action": "COVER", "symbol": symbol, "qty": "ALL", "type": "MKT",
+                            "ts": ts, "reason": "exit_ha_5m"})
+                self._flat(symbol, reason="exit_ha_5m", ts=ts)
+                return out
+
+            # Management helpers
+            # --- Safer BE/trailing logic for SHORT ---
+            R = abs(stop - entry)
+            favorable_move = entry - close  # for short, lower is better
+
+            # 1) Move stop to BE only after 0.75R favorable
+            if favorable_move >= 0.75 * R:
+                proposed = min(stop, entry)  # for short, lower = tighter
+                if proposed < stop:
+                    stop = self._set_stop("SHORT", symbol, ts, close, proposed, entry, stop, reason="be_0.75R")
+                    s["stop"] = stop
+                    s["be_active"] = True
+
+            # 2) Trail by ATR only after 1.5R favorable
+            if favorable_move >= 1.5 * R:
+                proposed = min(stop, close + 1.0 * atrv)
+                if proposed < stop:
+                    stop = self._set_stop("SHORT", symbol, ts, close, proposed, entry, stop, reason="trail_atr_1.5R")
+                    s["stop"] = stop
+
+            # --- Ratchet/trailing stop (SHORT) ---
+            self._maybe_ratchet_stop("short", s, close, atrv, getattr(self.cfg, "ratchet_pct_short", 4.0))
+            self._apply_ratchet(symbol, s, close, ts)
+
+            # 3) hard stop
+            if high >= s["stop"]:
+                be_exit = s.get("be_active", False) and abs(s["stop"] - entry) <= max(1e-6, 1e-6 * entry)
+                self._flat(symbol, reason="stop_hit", ts=ts)
+                out.append({"action":"COVER", "symbol":symbol, "qty":"ALL", "type":"MKT",
+                            "ts": ts, "reason":"stop_hit", "stop": s["stop"]})
+                self._dbg(symbol, last, tag="EXIT_STOP", extra={"stop": f"{s['stop']:.4f}", "high": f"{high:.4f}"})
+                if be_exit and getattr(self.cfg, "allow_reentry_after_be", False):
+                    s["allow_reentry_short"] = True
+                return out
+
+            # 4) partials   SHORT (cumulative-of-original)
+            filled = int(s.get("took_partial", 0))
+            moved  = (float(s["entry"]) - low) / float(s["entry"]) if s["entry"] else 0.0
+            levels = list(self.cfg_d.get("partial_levels", []))
+
+            while filled < len(levels) and s["size"] > 0:
+                lvl = levels[filled]
+                if moved < float(lvl["move_pct"]):
+                    break
+
+                orig = int(s.get("orig_size", s["size"]))
+                exited_so_far = orig - s["size"]
+                cum_frac = sum(float(levels[i]["exit_fraction"]) for i in range(filled + 1))
+                target_exited = int(round(orig * cum_frac))
+                qty = max(0, min(target_exited - exited_so_far, s["size"]))
+
+                if getattr(self, "debug_partials", False):
+                    self._log(f"[PARTIAL DEBUG] lvl={filled+1} mv={float(lvl['move_pct']):.4f} "
+                              f"orig={orig} sold_so_far={exited_so_far} desired_cum={target_exited} to_sell={qty}")
+
+                if qty <= 0:
+                    break
+
+                s["size"] -= qty
+                out.append({"action": "BUY_TO_COVER", "symbol": symbol, "qty": qty, "type": "MKT",
+                            "ts": ts, "reason": f"partial_{filled+1}_at_{float(lvl['move_pct'])*100:.2f}%"})
+                self._dbg(symbol, last, tag="PARTIAL",
+                          extra={"level": filled+1, "exit_frac": lvl["exit_fraction"], "qty": qty, "rem": s["size"]})
+
+                filled += 1
+                if getattr(self.cfg, "partial_one_per_bar", False):
+                    break
+
+            s["took_partial"] = filled
+            if s["size"] == 0:
+                self._flat(symbol, reason="all_partials_exit", ts=ts)
+                return out
+
+            # --- Ratchet/trailing stop (SHORT) after partials ---
+            self._maybe_ratchet_stop("short", s, close, atrv, getattr(self.cfg, "ratchet_pct_short", 4.0))
+
+            # 5) BE activation after N partials (legacy logic, can be removed if not needed)
+            if s["size"] > 0 and filled >= int(getattr(self.cfg, "be_after_partials", 0)):
+                proposed = min(s["stop"], entry)
+                # Clamp BE for SHORT: never above entry
+                proposed = min(proposed, entry)
+                s["stop"]  = self._set_stop("SHORT", symbol, ts, close, proposed, entry, s["stop"], reason="be_after_partials")
+                s["be_active"] = True
+
+            # 6) bias exit (cross up)
+            bullish_cross = (p_ema9 <= p_ema20) and (ema9 > p_ema20)
+            if bullish_cross and getattr(self.cfg, "bias_exit_on_cross", False):
+                self._flat(symbol, reason="bias_exit", ts=ts)
+                out.append({"action":"COVER", "symbol":symbol, "qty":"ALL", "type":"MKT", "ts": ts, "reason":"bias_exit"})
+                self._dbg(symbol, last, tag="EXIT_BIAS")
+                return out
+
+            return None
 
     def _elapsed_minutes(self, s: dict, ts) -> float:
         entered = s.get("entered_at")
@@ -439,143 +619,18 @@ class StrategyV13(StrategyBase):
 
         # Short: exit on bullish HA; Long: exit on bearish HA
         if s["side"] == "SELL_SHORT" and color == 1:
-            self._dbg(symbol, last, tag="EXIT_HA", extra={"tf": "5m", "fill": f"{float(last['close']):.4f}"})
-            self._exit_all(symbol, fill=float(last["close"]), cause="EXIT_HA")
+            self._dbg(symbol, last, tag="EXIT_HA_5M", extra={"fill": f"{float(last['close']):.4f}"})
             return True
         if s["side"] == "BUY" and color == -1:
-            self._dbg(symbol, last, tag="EXIT_HA", extra={"tf": "5m", "fill": f"{float(last['close']):.4f}"})
-            self._exit_all(symbol, fill=float(last["close"]), cause="EXIT_HA")
+            self._dbg(symbol, last, tag="EXIT_HA_5M", extra={"fill": f"{float(last['close']):.4f}"})
             return True
         return False
 
-    import re, json, os
-    from pathlib import Path
+
 
     def _parse_results_from_loglines(self, log_lines):
         # thin wrapper calling the pure top-level function
         return parse_sig_loglines_to_trades(log_lines)
-
-
-    def _log(self, msg: str) -> None:
-        """Store log lines and print them."""
-        if not hasattr(self, "_log_lines"):
-            self._log_lines = []
-        self._log_lines.append(msg)
-        print(msg, flush=True)
-
-    def _partial_debug(self, trade, level_idx: int):
-        """Print cumulative-of-original math for the given partial level."""
-        if not getattr(self, "debug_partials", False):
-            return
-        try:
-            levels = getattr(self, "partial_levels", []) or self.cfg_d.get("partial_levels", [])
-            if level_idx < 0 or level_idx >= len(levels):
-                return
-
-            mv = float(levels[level_idx].get("move_pct", 0.0))
-
-            # Sum exit fractions up to this level
-            frac_sum = 0.0
-            for j in range(level_idx + 1):
-                frac_sum += float(levels[j].get("exit_fraction", 0.0))
-
-            # Original size (robust recovery)
-            orig = int(
-                trade.get("orig_size")
-                or trade.get("initial_size")
-                or trade.get("size_initial", 0)
-                or trade.get("size", 0)
-                or (trade.get("remaining_shares", 0) + trade.get("sold_so_far", 0))
-            )
-
-            rem = int(trade.get("remaining_shares", trade.get("size", 0)))
-            sold_so_far = max(0, orig - rem)
-            desired_cum = int(math.floor(orig * frac_sum))
-            to_sell_dbg = max(0, desired_cum - sold_so_far)
-
-            logger = getattr(self, "_log", print)
-            logger(
-                f"[PARTIAL DEBUG] lvl={level_idx+1} mv={mv:.4f} "
-                f"orig={orig} sold_so_far={sold_so_far} "
-                f"desired_cum={desired_cum} to_sell={to_sell_dbg}"
-            )
-        except Exception:
-            # never let debug printing crash the strategy
-            pass
-
-    def _compute_position_size(self, *, entry: float, stop: float, direction: int) -> int:
-        """
-        Returns the position size.
-        - If cfg.use_risk_sizing is False: return cfg.base_size (>=1).
-        - If True: floor( (balance * risk_pct) / R_per_share ), then clamp and lot-round.
-        """
-        # default behavior
-        if not getattr(self.cfg, "use_risk_sizing", False):
-            return max(1, int(getattr(self.cfg, "base_size", 1)))
-
-        bal = float(getattr(self.cfg, "account_balance", 0.0))
-        risk_pct = float(getattr(self.cfg, "risk_pct_of_balance", 0.0))
-        lot = max(1, int(getattr(self.cfg, "lot_size", 1)))
-        smin = max(1, int(getattr(self.cfg, "min_size", 1)))
-        smax = max(smin, int(getattr(self.cfg, "max_size", 1)))
-
-        # risk per share (R)
-        if direction > 0:
-            r_ps = max(1e-6, entry - stop)
-        else:
-            r_ps = max(1e-6, stop - entry)
-
-        risk_dollars = max(0.0, bal * risk_pct)
-        raw = int(risk_dollars // r_ps)  # floor
-
-        # clamp & lot-round
-        size = max(smin, min(raw, smax))
-        size = (size // lot) * lot
-        size = max(smin, min(size, smax))
-        return size
-    """
-    Minute-bar strategy:
-      • EMA9/EMA20 cross + MACD confirm
-      • Optional VWAP filter
-      • ATR or fixed-% initial stop, ATR trail
-      • Partials + Breakeven + bias exits
-      • Symmetrical SHORT logic (optional)
-      • 1 trade per direction per day, with one re-entry after BE
-    """
-
-    def __init__(self, config):
-        # Accept dict OR dataclass OR a simple object with attrs
-        if isinstance(config, dict):
-            cfg_d = config
-        elif is_dataclass(config):
-            cfg_d = asdict(config)
-        else:
-            try:
-                cfg_d = {k: getattr(config, k) for k in vars(config)}
-            except Exception:
-                cfg_d = {}
-
-        # Keep both a dict and an attribute-style view
-        self.cfg_d = cfg_d                      # for dict-style .get()
-        self.cfg   = SimpleNamespace(**cfg_d)   # for attribute-style .foo
-
-        # Debug: reuse your existing flag (no JSON changes needed)
-        self.debug_partials = bool(self.cfg_d.get("debug_signals", False))
-
-        # Cache partial levels list from config (flat schema)
-        self.partial_levels = list(self.cfg_d.get("partial_levels", []))
-
-        # --- entry window resolver config ---
-        self.entry_window_spec = self.cfg_d.get("entry_window", "09:30-16:00")  # old engine default RTH
-        self.tz_name = self.cfg_d.get("timezone", "US/Eastern")
-
-        # --- HA(5m) aggregator ---
-        self.ha5m = HA5m()
-
-        self.ctx: Optional[StrategyContext] = None
-        self.buffers: Dict[str, pd.DataFrame] = {}
-        # per-symbol position & accounting
-        self.state: Dict[str, Dict[str, Any]] = {}
 
     def _resolve_entry_window(self, session_date) -> Optional[Tuple[datetime, datetime]]:
         """
@@ -596,7 +651,7 @@ class StrategyV13(StrategyBase):
         if isinstance(spec, str) and "-" in spec:
             s, e = spec.split("-", 1)
             # interpret in local tz, then convert to UTC
-            import pytz
+            
             local = pytz.timezone(self.tz_name)
             sdt_local = local.localize(datetime.strptime(f"{session_date} {s}", "%Y-%m-%d %H:%M"))
             edt_local = local.localize(datetime.strptime(f"{session_date} {e}", "%Y-%m-%d %H:%M"))
@@ -693,164 +748,266 @@ class StrategyV13(StrategyBase):
         if not hasattr(self, "_log_lines"):
             self._log_lines = []
 
-        # Optional: pick up output settings if not already set
-        if not hasattr(self, "results_dump_path"):
-            self.results_dump_path = "./logs/results"
-        if not hasattr(self, "results_run_label"):
-            self.results_run_label = "risk"
+        # Ensure we have a proper logger and that self._log is callable
+        existing_log = getattr(self, "_log", None)
 
-        # --- entry window UTC bounds (once per run) ---
-        self.entry_start_utc, self.entry_end_utc = None, None
-        if self.date:
-            ew = self._resolve_entry_window(self.date)
-            if ew:
-                self.entry_start_utc, self.entry_end_utc = ew
-                self._log(f"[CONFIG] entry_window={self.entry_window_spec}  {_fmt_ts(self.entry_start_utc)}–{_fmt_ts(self.entry_end_utc)}")
-        # Initialize buffers/state for the symbols we're going to trade
-        for sym in self.symbols:
-            self.buffers[sym] = pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
-            self.state[sym] = {
-                "pos": 0, "entry": None, "stop": None, "r": None,
-                "size": 0, "orig_size": 0, "took_partial": 0, "be_active": False,
-                "allow_reentry_long": False, "allow_reentry_short": False,
-                "entries_long": 0, "entries_short": 0,
-            }
-        print(f"[StrategyV13] start date={self.date} symbols={self.symbols}")
+        # If someone injected a Logger into self._log, adopt it
+        if isinstance(existing_log, logging.Logger):
+            self.logger = existing_log
+
+        # Fallback logger if none present
+        if not hasattr(self, "logger") or not isinstance(self.logger, logging.Logger):
+            self.logger = logging.getLogger(self.__class__.__name__)
+
+        # If self._log isn't a callable, wrap it so self._log("...") always works
+        if not callable(existing_log):
+            def _emit(msg: str):
+                # buffer the line for later dump (preserves your existing behavior)
+                try:
+                    self._log_lines.append(str(msg))
+                except Exception:
+                    pass
+                # send to logger; if logger fails, last-resort print
+                try:
+                    self.logger.info(msg)
+                except Exception:
+                    print(str(msg), flush=True)
+            self._log = _emit
+
+        # Pick up output settings from config (JSON) if present
+        self.results_dump_path = self.cfg_d.get("results_dump_path", getattr(self, "results_dump_path", "./logs/results"))
+        self.results_run_label = self.cfg_d.get("results_run_label", getattr(self, "results_run_label", "run"))
+
+    # Load tier-specific stop percent mapping if present
+    self.fixed_sl_by_tier = dict(self.cfg_d.get("fixed_sl_pct_by_tier", {}))
+
+    # pull from JSON (no hard-coded window here)
+    self.entry_window_spec = self.cfg_d.get("entry_window", None)
+    self.tz_name = self.cfg_d.get("timezone", "US/Eastern")
+
+    # one-time helpers/containers
+    self.ha5m = HA5m()
+    self.buffers = {}
+    self.state = {}
+
+    # --- entry window UTC bounds (once per run) ---
+    self.entry_start_utc, self.entry_end_utc = None, None
+    if self.date:
+        ew = self._resolve_entry_window(self.date)
+        if ew:
+            self.entry_start_utc, self.entry_end_utc = ew
+            self._log(f"[CONFIG] entry_window={self.entry_window_spec}   "
+                    f"{self.entry_start_utc.isoformat()} {self.entry_end_utc.isoformat()}")
+        else:
+            self._log("[CONFIG] entry_window=None (no restriction)")
+
+    # Initialize buffers/state for the symbols we're going to trade
+    for sym in self.symbols:
+        self.buffers[sym] = pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+        self.state[sym] = {
+            "pos": 0, "entry": None, "stop": None, "r": None,
+            "size": 0, "orig_size": 0, "took_partial": 0, "be_active": False,
+            "allow_reentry_long": False, "allow_reentry_short": False,
+            "entries_long": 0, "entries_short": 0,
+        }
+    print(f"[StrategyV13] start date={self.date} symbols={self.symbols}")
 
     def on_bar(self, symbol: str, bar: Bar) -> Optional[Iterable[Dict[str, Any]]]:
-        df = self.buffers[symbol]
 
-        # --- normalize ts to UTC ---
+        # --- set current bar time for logging ---
+        ts = getattr(bar, "ts", None)
+        if ts is None and isinstance(bar, dict):
+            ts = bar.get("ts")
+        self._set_now(ts)
+
+        # --- prepare state/buffers ---
+        df = self.buffers[symbol]
+        s  = self.state[symbol]
+        out: List[Dict[str, Any]] = []
+
+        # Normalize timestamp to UTC pandas Timestamp
         ts = pd.Timestamp(bar["timestamp"])
         if ts.tzinfo is None:
             ts = ts.tz_localize("UTC")
         else:
             ts = ts.tz_convert("UTC")
 
-        # append minute bar
-        df.loc[len(df)] = {
+        # Append bar to buffer
+        row_dict = {
             "timestamp": ts,
-            "open": float(bar["open"]),
-            "high": float(bar["high"]),
-            "low":  float(bar["low"]),
+            "open":  float(bar.get("open",  bar["close"])),
+            "high":  float(bar.get("high",  bar["close"])),
+            "low":   float(bar.get("low",   bar["close"])),
             "close": float(bar["close"]),
-            "volume": float(bar["volume"]),
+            "volume": float(bar.get("volume", 0.0)),
+        }
+        df.loc[len(df)] = row_dict
+
+
+        # ---- context needed by the logic below ----
+        # Use the last row in the DataFrame for all references
+        row = df.iloc[-1]
+        last = row.to_dict()
+        self._last_ts = getattr(bar, "ts", None) or last.get("ts")
+        s = self.state[symbol]                          # per-symbol state (dict)
+        ts = self._as_utc(row["timestamp"])            # timestamp for this bar (UTC)
+
+        close = row["close"]
+        open_ = row["open"]
+        high = row["high"]
+        low = row["low"]
+        # -------------------------------------------
+        closes = df["close"]
+        ema9_series  = closes.ewm(span=9,  adjust=False).mean()
+        ema20_series = closes.ewm(span=20, adjust=False).mean()
+        ema9  = float(ema9_series.iloc[-1])
+        ema20 = float(ema20_series.iloc[-1])
+        p_ema9  = float(ema9_series.iloc[-2])  if len(ema9_series)  > 1 else ema9
+        p_ema20 = float(ema20_series.iloc[-2]) if len(ema20_series) > 1 else ema20
+
+        # MACD(12,26,9)
+        ema12 = closes.ewm(span=12, adjust=False).mean()
+        ema26 = closes.ewm(span=26, adjust=False).mean()
+        macd_line = ema12 - ema26
+        sig_line  = macd_line.ewm(span=9, adjust=False).mean()
+        macd_now = float(macd_line.iloc[-1])
+        sig_now  = float(sig_line.iloc[-1])
+
+        # ATR(14)
+        hi = df["high"]; lo = df["low"]; cl = df["close"]
+        prev_close = cl.shift(1)
+        tr = pd.concat([
+            (hi - lo).abs(),
+            (hi - prev_close).abs(),
+            (lo - prev_close).abs()
+        ], axis=1).max(axis=1)
+        atr_series = tr.ewm(span=14, adjust=False).mean()
+        atrv = float(atr_series.iloc[-1])
+        fill_px = close  # parity: log minute close as the fill
+        # VWAP (session cumulative)
+        typical = (hi + lo + cl) / 3.0
+        vol = df["volume"].fillna(0.0)
+        tpv = (typical * vol).cumsum()
+        cv  = vol.cumsum().replace(0, np.nan)
+        vwap_series = (tpv / cv).fillna(cl)
+        vwap_val = float(vwap_series.iloc[-1])
+        above_vwap = close >= vwap_val
+        below_vwap = close <  vwap_val
+
+        # Pack 'last' for _dbg / _maybe_exit_ha
+        last = {
+            "timestamp": ts,
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "ema_9": ema9,
+            "ema_20": ema20,
+            "macd": macd_now,
+            "macd_signal": sig_now,
+            "vwap": vwap_val,
+            "atr": atrv,
         }
 
-        # indicators
-        bundle  = ma_bundle(df)              # ema/sma 9/20/50/200...
-        macd_df = macd(df["close"])
-        atr_s   = atr(df["high"], df["low"], df["close"]).rename("atr")
-        vwap_s  = vwap(df).rename("vwap")
-
-        X = pd.concat([df, bundle, macd_df, atr_s.to_frame(), vwap_s.to_frame()], axis=1)
-        X = X.loc[:, ~X.columns.duplicated(keep="last")]
-        if len(X) > 2000:
-            X = X.iloc[-2000:].reset_index(drop=True)
-        self.buffers[symbol] = X
-
-        if len(X) < 2:
-            return None
-        last = X.iloc[-1]
-        prev = X.iloc[-2]
-
-        # warmup (EMA200 optional by default; set require_ema200 if you add it to config later)
-        require_ema200 = getattr(self.cfg, "require_ema200", False)
-        base_required = ("atr","macd","macd_signal","vwap")
-        required = base_required + (("ema_200",) if require_ema200 else ())
-        if not all(k in last.index and pd.notna(last[k]) for k in required):
-            return None
-
-        # convenience
-        close = float(last["close"])
-        low   = float(last["low"])
-        high  = float(last["high"])
-        atrv  = float(last["atr"])
-        ema9, ema20 = float(last.get("ema_9", np.nan)), float(last.get("ema_20", np.nan))
-        p_ema9, p_ema20 = float(prev.get("ema_9", np.nan)), float(prev.get("ema_20", np.nan))
-        macd_now, sig_now = float(last["macd"]), float(last["macd_signal"])
-        above_vwap = close >= float(last["vwap"])
-        below_vwap = not above_vwap
-
-        s = self.state[symbol]
-        out: List[Dict[str, Any]] = []
-
-        # ---------- entries ----------
+        # ---------- entries (only when flat) ----------
         if s["pos"] == 0:
             can_enter = True
             if getattr(self, "entry_start_utc", None) is not None and getattr(self, "entry_end_utc", None) is not None:
                 can_enter = (self.entry_start_utc <= ts <= self.entry_end_utc)
 
+            if getattr(self.cfg, "debug_signals", True):
+                every = int(self.cfg_d.get("trace_every_n", 1))
+                self._trace_i = getattr(self, "_trace_i", 0) + 1
+                if every <= 1 or (self._trace_i % every == 0) or can_enter:
+                    print(f"[TRACE] gate | ts={ts} | can_enter={can_enter}")
+
             if can_enter:
-                # LONG setup
+                # reset any previous tier flag for this evaluation
+                self._last_entry_tier = None
+                # LONG signal
                 bullish_cross = (p_ema9 <= p_ema20) and (ema9 > ema20)
                 long_ok = bullish_cross and (macd_now > sig_now)
-                if self.cfg.vwap_filter:
+                if getattr(self.cfg, "vwap_filter", False):
                     long_ok = long_ok and above_vwap
-                # enforce trade-frequency limits
-                can_long = (s["entries_long"] < self.cfg.max_trades_per_dir) or s["allow_reentry_long"]
+                can_long = (s["entries_long"] < getattr(self.cfg, "max_trades_per_dir", 1)) or s.get("allow_reentry_long", False)
+
+                # SHORT signal
+                allow_shorts = getattr(self.cfg, "allow_shorts", True)
+                short_ok = False; can_short = False
+                if allow_shorts:
+                    bearish_cross = (p_ema9 >= p_ema20) and (ema9 < ema20)
+                    short_ok = bearish_cross and (macd_now < sig_now)
+                    if getattr(self.cfg, "vwap_filter", False):
+                        short_ok = short_ok and below_vwap
+                    can_short = (s["entries_short"] < getattr(self.cfg, "max_trades_per_dir", 1)) or s.get("allow_reentry_short", False)
+
+                if getattr(self.cfg, "debug_signals", True):
+                    self._log(
+                        f"[TRACE] sig | long_ok={long_ok} short_ok={short_ok} "
+                        f"vwap_filter={getattr(self.cfg, 'vwap_filter', False)} "
+                        f"allow_shorts={allow_shorts} "
+                        f"ema9={ema9:.4f} ema20={ema20:.4f} macd={macd_now:.4f} sig={sig_now:.4f} vwap={vwap_val:.4f}"
+                    )
 
                 if long_ok and can_long:
                     entry = close
                     stop  = self._initial_stop(entry, atrv, direction=+1)
                     r     = max(1e-9, entry - stop)
+                    # Decide sizing tier for this entry
+                    self._last_entry_tier = "A"   # cross-based long = Tier A
                     size  = self._compute_position_size(entry=entry, stop=stop, direction=+1)
                     s.update({
                         "pos": +1, "entry": entry, "stop": stop, "r": r,
-                        "size": size, "orig_size": size,
-                        "took_partial": 0, "be_active": False
+                        "size": size, "orig_size": size, "took_partial": 0, "be_active": False,
+                        "side": "BUY", "symbol": symbol, "best": entry
                     })
-                    # consume reentry flag if used
-                    if s["allow_reentry_long"]:
-                        s["allow_reentry_long"] = False
-                    else:
-                        s["entries_long"] += 1
+                    if s.get("allow_reentry_long"): s["allow_reentry_long"] = False
+                    else: s["entries_long"] += 1
                     out.append({"action":"BUY", "symbol":symbol, "qty":size, "type":"MKT",
-                                "ts": ts, "entry": entry, "stop": stop, "reason":"ema9>ema20 + macd>sig" + (" + vwap" if self.cfg.vwap_filter else "")})
+                                "ts": ts, "entry": entry, "stop": stop,
+                                "reason":"ema9>ema20 + macd>sig" + (" + vwap" if getattr(self.cfg, "vwap_filter", False) else "")})
                     self._dbg(symbol, last, tag="BUY", extra={"entry": f"{entry:.4f}", "stop": f"{stop:.4f}", "R": f"{r:.4f}", "size": size})
                     return out
 
-                # SHORT setup (optional)
-                if self.cfg.allow_shorts:
-                    bearish_cross = (p_ema9 >= p_ema20) and (ema9 < ema20)
-                    short_ok = bearish_cross and (macd_now < sig_now)
-                    if self.cfg.vwap_filter:
-                        short_ok = short_ok and below_vwap
-                    can_short = (s["entries_short"] < self.cfg.max_trades_per_dir) or s["allow_reentry_short"]
+                if short_ok and can_short:
+                    entry = close
+                    stop  = self._initial_stop(entry, atrv, direction=-1)
+                    r     = max(1e-9, stop - entry)
+                    # Decide sizing tier for this entry
+                    self._last_entry_tier = "A"   # cross-based short = Tier A
+                    size  = self._compute_position_size(entry=entry, stop=stop, direction=-1)
+                    s.update({
+                        "pos": -1, "entry": entry, "stop": stop, "r": r,
+                        "size": size, "orig_size": size, "took_partial": 0, "be_active": False,
+                        "side": "SELL_SHORT", "symbol": symbol, "best": entry
+                    })
+                    if s.get("allow_reentry_short"): s["allow_reentry_short"] = False
+                    else: s["entries_short"] += 1
+                    out.append({"action":"SELL_SHORT", "symbol":symbol, "qty":size, "type":"MKT",
+                                "ts": ts, "entry": entry, "stop": stop,
+                                "reason":"ema9<ema20 + macd<sig" + (" + vwap" if getattr(self.cfg, "vwap_filter", False) else "")})
+                    self._dbg(symbol, last, tag="SELL_SHORT", extra={"entry": f"{entry:.4f}", "stop": f"{stop:.4f}", "R": f"{r:.4f}", "size": size})
+                    return out
 
-                    if short_ok and can_short:
-                        entry = close
-                        stop  = self._initial_stop(entry, atrv, direction=-1)
-                        r     = max(1e-9, stop - entry)
-                        size  = self._compute_position_size(entry=entry, stop=stop, direction=-1)
-                        s.update({
-                            "pos": -1, "entry": entry, "stop": stop, "r": r,
-                            "size": size, "orig_size": size,
-                            "took_partial": 0, "be_active": False
-                        })
-                        if s["allow_reentry_short"]:
-                            s["allow_reentry_short"] = False
-                        else:
-                            s["entries_short"] += 1
-                        out.append({"action":"SELL_SHORT", "symbol":symbol, "qty":size, "type":"MKT",
-                                    "ts": ts, "entry": entry, "stop": stop, "reason":"ema9<ema20 + macd<sig" + (" + vwap" if self.cfg.vwap_filter else "")})
-                        self._dbg(symbol, last, tag="SELL_SHORT", extra={"entry": f"{entry:.4f}", "stop": f"{stop:.4f}", "R": f"{r:.4f}", "size": size})
-                        return out
-
+            return None  # stayed flat
 
         # ---------- manage LONG ----------
         if s["pos"] == +1:
-            entry = float(s["entry"]); stop = float(s["stop"]); r = float(s["r"])
+            entry = float(s["entry"]); stop = float(s["stop"])
 
-            # Unified HA(5m) exit precedence (only if enabled)
-            if self._maybe_exit_ha_5m(symbol, s, last, ts, close):
+            # HA(5m) exit precedence
+            if self._maybe_exit_ha(symbol, s, last):
+                out.append({"action": "SELL", "symbol": symbol, "qty": "ALL", "type": "MKT",
+                            "ts": ts, "reason": "exit_ha_5m"})
+                self._flat(symbol, reason="exit_ha_5m", ts=ts)
                 return out
 
-            # Management helpers (run every bar while in position)
-            self._maybe_activate_be(symbol, s, last["timestamp"])
-            self._apply_ratchet(symbol, s, float(last["close"]), last["timestamp"])
-            if self._maybe_exit_ha(symbol, s, last):
-                return
+
+            # Management helpers
+            self._maybe_activate_be(symbol, s, ts)
+            # --- Ratchet/trailing stop (LONG) ---
+            self._maybe_ratchet_stop("long", s, close, ts, atrv, getattr(self.cfg, "ratchet_pct_long", 4.0))
+            self._apply_ratchet(symbol, s, close, ts)
 
             # 1) hard stop
             if low <= stop:
@@ -859,125 +1016,295 @@ class StrategyV13(StrategyBase):
                 out.append({"action":"SELL", "symbol":symbol, "qty":"ALL", "type":"MKT",
                             "ts": ts, "reason":"stop_hit", "stop": stop})
                 self._dbg(symbol, last, tag="EXIT_STOP", extra={"stop": f"{stop:.4f}", "low": f"{low:.4f}"})
-                if be_exit and self.cfg.allow_reentry_after_be:
-                    self.state[symbol]["allow_reentry_long"] = True
+                if be_exit and getattr(self.cfg, "allow_reentry_after_be", False):
+                    s["allow_reentry_long"] = True
                 return out
 
-            # 2) trail stop by ATR
-            new_stop = self._trail_stop(close, atrv, stop, direction=-1)
-            if new_stop < stop:
-                s["stop"] = self._set_stop("SHORT", symbol, ts, close, new_stop, s["entry"], stop, reason="trail_atr")
+            # 2) trail stop by ATR (LONG   direction=+1)
+            new_stop = self._trail_stop(close, atrv, stop, direction=+1)
+            if new_stop > stop:
+                if s.get("be_active", False):
+                    # Never move stop below the entry price once BE is active
+                    new_stop = max(new_stop, float(s["entry"]))
+                s["stop"] = self._set_stop("LONG", symbol, ts, close, new_stop, s["entry"], stop, reason="trail_atr")
 
-            # 3) partials  (LONG; cumulative-of-original)
+
+            # 3) partials (cumulative-of-original)   LONG
             filled = int(s.get("took_partial", 0))
-            moved  = (high - entry) / entry if entry else 0.0
-            levels = list(self.cfg.partial_levels) if self.cfg.partial_levels else []
+            moved  = (high - float(s["entry"])) / float(s["entry"]) if s["entry"] else 0.0
+            levels = list(self.cfg_d.get("partial_levels", []))
 
-            # exit levels only if we still have size and price has moved enough
             while filled < len(levels) and s["size"] > 0:
                 lvl = levels[filled]
                 if moved < float(lvl["move_pct"]):
                     break
 
-                # cumulative-of-original math
                 orig = int(s.get("orig_size", s["size"]))
                 exited_so_far = orig - s["size"]
                 cum_frac = sum(float(levels[i]["exit_fraction"]) for i in range(filled + 1))
                 target_exited = int(round(orig * cum_frac))
-                qty = target_exited - exited_so_far
+                qty = max(0, min(target_exited - exited_so_far, s["size"]))
 
+                # (optional) debug
+                if getattr(self, "debug_partials", False):
+                    self._log(f"[PARTIAL DEBUG] lvl={filled+1} mv={float(lvl['move_pct']):.4f} "
+                              f"orig={orig} sold_so_far={exited_so_far} desired_cum={target_exited} to_sell={qty}")
 
-                # clamp & guard
-                qty = max(0, min(qty, s["size"]))
                 if qty <= 0:
                     break
 
-                # --- DEBUG: cumulative math (pre-sell) ---
-                if self.debug_partials:
-                    self._log(
-                        f"[PARTIAL DEBUG] lvl={filled+1} mv={float(lvl['move_pct']):.4f} "
-                        f"orig={orig} sold_so_far={exited_so_far} desired_cum={target_exited} to_sell={qty}"
-                    )
-
                 s["size"] -= qty
-                out.append({
-                    "action": "SELL", "symbol": symbol, "qty": qty, "type": "MKT",
-                    "ts": ts, "reason": f"partial_{filled+1}_at_{lvl['move_pct']*100:.2f}%"
-                })
+                out.append({"action": "SELL", "symbol": symbol, "qty": qty, "type": "MKT",
+                            "ts": ts, "reason": f"partial_{filled+1}_at_{float(lvl['move_pct'])*100:.2f}%"})
                 self._dbg(symbol, last, tag="PARTIAL",
                           extra={"level": filled+1, "exit_frac": lvl["exit_fraction"], "qty": qty, "rem": s["size"]})
 
                 filled += 1
-                if self.cfg.partial_one_per_bar:
+                if getattr(self.cfg, "partial_one_per_bar", False):
                     break
 
             s["took_partial"] = filled
-
-            # if fully flat after partials, stop managing this leg
             if s["size"] == 0:
                 self._flat(symbol, reason="all_partials_exit", ts=ts)
                 return out
 
-            # 4) breakeven activation after N partials
-            if s["size"] > 0 and filled >= int(self.cfg.be_after_partials):
+            # --- Ratchet/trailing stop (LONG) after partials ---
+            self._maybe_ratchet_stop("long", s, close, ts, atrv, getattr(self.cfg, "ratchet_pct_long", 4.0))
+
+            # 4) BE activation after N partials
+            if s["size"] > 0 and filled >= int(getattr(self.cfg, "be_after_partials", 0)):
                 proposed = max(s["stop"], entry)
-                s["stop"]  = self._set_stop("SHORT", symbol, ts, close, proposed, entry, s["stop"], reason="be_after_partials")
+                # Clamp BE for LONG: never below entry
+                proposed = max(proposed, entry)
+                s["stop"]  = self._set_stop("LONG", symbol, ts, close, proposed, entry, s["stop"], reason="be_after_partials")
                 s["be_active"] = True
 
-            # 5) bias exit (cross down or vwap loss + macd flip)
+            # 5) bias exit (cross down)
             bearish_cross = (p_ema9 >= p_ema20) and (ema9 < ema20)
-            macd_flip     = macd_now < sig_now
-            vwap_lost     = (not above_vwap) if self.cfg.vwap_filter else False
-            if bearish_cross or (vwap_lost and macd_flip):
+            if bearish_cross and getattr(self.cfg, "bias_exit_on_cross", False):
                 self._flat(symbol, reason="bias_exit", ts=ts)
-                out.append({"action":"SELL", "symbol":symbol, "qty":"ALL", "type":"MKT",
-                            "ts": ts, "reason":"bias_exit"})
+                out.append({"action":"SELL", "symbol":symbol, "qty":"ALL", "type":"MKT", "ts": ts, "reason":"bias_exit"})
                 self._dbg(symbol, last, tag="EXIT_BIAS")
                 return out
 
+            return None
 
         # ---------- manage SHORT ----------
-        if s["pos"] == -1 and self.cfg.allow_shorts:
-            entry = float(s["entry"]); stop = float(s["stop"]); r = float(s["r"])
+        if s["pos"] == -1:
+            entry = float(s["entry"]); stop = float(s["stop"])
 
-            # Unified HA(5m) exit precedence (only if enabled)
-            if self._maybe_exit_ha_5m(symbol, s, last, ts, close):
+            # HA(5m) exit precedence
+            if self._maybe_exit_ha(symbol, s, last):
+                out.append({"action": "COVER", "symbol": symbol, "qty": "ALL", "type": "MKT",
+                            "ts": ts, "reason": "exit_ha_5m"})
+                self._flat(symbol, reason="exit_ha_5m", ts=ts)
                 return out
-    def _maybe_exit_ha_5m(self, symbol, s, last, ts, close):
-        """
-        Unified HA(5m) exit for both LONG and SHORT. Always logs [SIG] EXIT_HA_5M.
-        Returns True if an exit was triggered.
-        """
-        if not self.cfg_d.get("exits", {}).get("enable_ha_5m", True):
-            return False
-        ha_done = self.ha5m.update(ts, float(last["open"]), float(last["high"]), float(last["low"]), float(last["close"]))
-        if not (ha_done and s.get("size", 0) > 0):
-            return False
-        ha_up = (ha_done["dir"] == "up")
-        # LONG: exit if not up; SHORT: exit if up
-        if (s.get("pos") == +1 and not ha_up) or (s.get("pos") == -1 and ha_up):
-            self._log(f"[SIG] EXIT_HA_5M | sym={symbol} | ts={_fmt_ts(ha_done['ts'])} | close={close:.4f} | fill={close:.4f}")
-            self._flat(symbol, reason="exit_ha_5m", ts=ha_done["ts"])
-            return True
-        return False
 
-        return out or None
+
+            # Management helpers
+            self._maybe_activate_be(symbol, s, ts)
+            # --- Ratchet/trailing stop (SHORT) ---
+            self._maybe_ratchet_stop("short", s, close, ts, atrv, getattr(self.cfg, "ratchet_pct_short", 4.0))
+            self._apply_ratchet(symbol, s, close, ts)
+
+            # 1) hard stop
+            if high >= stop:
+                be_exit = s.get("be_active", False) and abs(stop - entry) <= max(1e-6, 1e-6 * entry)
+                self._flat(symbol, reason="stop_hit", ts=ts)
+                out.append({"action":"COVER", "symbol":symbol, "qty":"ALL", "type":"MKT",
+                            "ts": ts, "reason":"stop_hit", "stop": stop})
+                self._dbg(symbol, last, tag="EXIT_STOP", extra={"stop": f"{stop:.4f}", "high": f"{high:.4f}"})
+                if be_exit and getattr(self.cfg, "allow_reentry_after_be", False):
+                    s["allow_reentry_short"] = True
+                return out
+
+            # 2) trail stop by ATR (SHORT   direction=-1)
+            new_stop = self._trail_stop(close, atrv, stop, direction=-1)
+            if new_stop < stop:
+                if s.get("be_active", False):
+                    # Never move stop above the entry price once BE is active (SHORT)
+                    new_stop = min(new_stop, float(s["entry"]))
+                s["stop"] = self._set_stop("SHORT", symbol, ts, close, new_stop, s["entry"], stop, reason="trail_atr")
+
+
+            # 3) partials   SHORT (cumulative-of-original)
+            filled = int(s.get("took_partial", 0))
+            moved  = (float(s["entry"]) - low) / float(s["entry"]) if s["entry"] else 0.0
+            levels = list(self.cfg_d.get("partial_levels", []))
+
+            while filled < len(levels) and s["size"] > 0:
+                lvl = levels[filled]
+                if moved < float(lvl["move_pct"]):
+                    break
+
+                orig = int(s.get("orig_size", s["size"]))
+                exited_so_far = orig - s["size"]
+                cum_frac = sum(float(levels[i]["exit_fraction"]) for i in range(filled + 1))
+                target_exited = int(round(orig * cum_frac))
+                qty = max(0, min(target_exited - exited_so_far, s["size"]))
+
+                if getattr(self, "debug_partials", False):
+                    self._log(f"[PARTIAL DEBUG] lvl={filled+1} mv={float(lvl['move_pct']):.4f} "
+                              f"orig={orig} sold_so_far={exited_so_far} desired_cum={target_exited} to_sell={qty}")
+
+                if qty <= 0:
+                    break
+
+                s["size"] -= qty
+                out.append({"action": "BUY_TO_COVER", "symbol": symbol, "qty": qty, "type": "MKT",
+                            "ts": ts, "reason": f"partial_{filled+1}_at_{float(lvl['move_pct'])*100:.2f}%"})
+                self._dbg(symbol, last, tag="PARTIAL",
+                          extra={"level": filled+1, "exit_frac": lvl["exit_fraction"], "qty": qty, "rem": s["size"]})
+
+                filled += 1
+                if getattr(self.cfg, "partial_one_per_bar", False):
+                    break
+
+            s["took_partial"] = filled
+            if s["size"] == 0:
+                self._flat(symbol, reason="all_partials_exit", ts=ts)
+                return out
+
+            # --- Ratchet/trailing stop (SHORT) after partials ---
+            self._maybe_ratchet_stop("short", s, close, ts, atrv, getattr(self.cfg, "ratchet_pct_short", 4.0))
+
+            # 4) BE activation after N partials
+            if s["size"] > 0 and filled >= int(getattr(self.cfg, "be_after_partials", 0)):
+                proposed = min(s["stop"], entry)
+                # Clamp BE for SHORT: never above entry
+                proposed = min(proposed, entry)
+                s["stop"]  = self._set_stop("SHORT", symbol, ts, close, proposed, entry, s["stop"], reason="be_after_partials")
+                s["be_active"] = True
+
+            # 5) bias exit (cross up)
+            bullish_cross = (p_ema9 <= p_ema20) and (ema9 > ema20)
+            if bullish_cross and getattr(self.cfg, "bias_exit_on_cross", False):
+                self._flat(symbol, reason="bias_exit", ts=ts)
+                out.append({"action":"COVER", "symbol":symbol, "qty":"ALL", "type":"MKT", "ts": ts, "reason":"bias_exit"})
+                self._dbg(symbol, last, tag="EXIT_BIAS")
+                return out
+
+            return None
+
+    ##
+
 
     # --- helpers --------------------------------------------------------------
 
-    def _initial_stop(self, entry: float, atrv: float, *, direction: int) -> float:
-        if self.cfg.stop_mode == "fixed":
-            pct = float(self.cfg.fixed_sl_pct)
-            if direction > 0:   # long
-                return entry * (1.0 - pct)
-            else:               # short
-                return entry * (1.0 + pct)
-        # ATR
-        k = float(self.cfg.atr_mult)
-        if direction > 0:
-            return entry - k * atrv
+    def _profit_pct(self, s: dict, price: float) -> float:
+        """
+        Favorable move from entry, signed as a positive percent for the active side.
+        LONG:  (price - entry) / entry
+        SHORT: (entry - price) / entry
+        """
+        try:
+            entry = float(s.get("entry") or s.get("entry_px") or 0.0)
+            if entry <= 0:
+                return 0.0
+            p = float(price)
+            if s.get("side") == "SELL_SHORT" or s.get("pos") == -1:
+                return (entry - p) / entry
+            return (p - entry) / entry
+        except Exception:
+            return 0.0
+
+    def _set_stop(
+        self,
+        side: str,
+        symbol: str,
+        ts,
+        price: float,
+        proposed: float,
+        entry: float,
+        prev_stop: float,
+        *,
+        reason: str = ""
+    ) -> float:
+        """
+        Clamp stop so it never loosens:
+          - LONG:  new_stop = max(prev_stop, proposed); if BE active, never below entry
+          - SHORT: new_stop = min(prev_stop, proposed); if BE active, never above entry
+        Also prints a small info line when the stop actually tightens.
+        """
+        try:
+            ts_iso = pd.Timestamp(ts).isoformat()
+        except Exception:
+            ts_iso = str(ts)
+
+        new_stop = float(proposed)
+        entry = float(entry)
+        prev_stop = float(prev_stop)
+
+        if side.upper().startswith("LONG"):
+            # tighten only upward
+            new_stop = max(prev_stop, new_stop)
+            if self.state.get(symbol, {}).get("be_active", False):
+                new_stop = max(new_stop, entry)
+            if new_stop > prev_stop + 1e-12:
+                self._log(f"[INFO] STOP_UPDATE | sym={symbol} | ts={ts_iso} | from={prev_stop:.4f} -> {new_stop:.4f} | reason={reason}")
+            return new_stop
+
+        # SHORT
+        new_stop = min(prev_stop, new_stop)
+        if self.state.get(symbol, {}).get("be_active", False):
+            new_stop = min(new_stop, entry)
+        if new_stop < prev_stop - 1e-12:
+            self._log(f"[INFO] STOP_UPDATE | sym={symbol} | ts={ts_iso} | from={prev_stop:.4f} -> {new_stop:.4f} | reason={reason}")
+        return new_stop
+
+    def _maybe_ratchet_stop(self, side: str, s: dict, price: float, ts, atrv: float, ratchet_pct: float) -> None:
+        """
+        'Best-price' ratchet independent from ATR trail:
+          - LONG: track highest price since entry; stop >= best*(1 - ratchet_pct%)
+          - SHORT: track lowest price since entry; stop <= best*(1 + ratchet_pct%)
+        Does nothing if inputs are missing or ratchet_pct is falsy.
+        """
+        try:
+            rpct = float(ratchet_pct)
+        except Exception:
+            rpct = 0.0
+        if rpct <= 0:
+            return
+
+        side_l = (side or "").lower()
+        entry = float(s.get("entry") or 0.0)
+        if entry <= 0:
+            return
+
+        px = float(price)
+        if side_l == "long":
+            # update best seen
+            s["best"] = max(float(s.get("best", entry)), px)
+            target = s["best"] * (1.0 - rpct / 100.0)
+            if target > float(s["stop"]):
+                s["stop"] = self._set_stop("LONG", s.get("symbol", ""), ts, px, target, entry, s["stop"], reason=f"ratchet_{rpct}%")
         else:
-            return entry + k * atrv
+            # short
+            s["best"] = min(float(s.get("best", entry)), px)
+            target = s["best"] * (1.0 + rpct / 100.0)
+            if target < float(s["stop"]):
+                s["stop"] = self._set_stop("SHORT", s.get("symbol", ""), ts, px, target, entry, s["stop"], reason=f"ratchet_{rpct}%")
+
+    def _initial_stop(self, entry: float, atrv: float, *, direction: int) -> float:
+        stop_mode = getattr(self.cfg, "stop_mode", "fixed")
+        cfg = getattr(self, "cfg_d", {}) or {}
+        if stop_mode == "fixed":
+            pct = cfg.get("fixed_sl_pct", 0.10)
+            tier = getattr(self, "_last_entry_tier", None) or getattr(self, "_last_tier", None)
+            if tier and tier in getattr(self, "fixed_sl_by_tier", {}):
+                pct = float(self.fixed_sl_by_tier[tier])
+
+            if direction > 0:
+                stop = entry * (1.0 - pct)
+            else:
+                stop = entry * (1.0 + pct)
+            return stop, pct
+        # ATR
+        k = float(cfg.get("atr_mult", 2.0))
+        if direction > 0:
+            return entry - k * atrv, None
+        else:
+            return entry + k * atrv, None
 
     def _trail_stop(self, close: float, atrv: float, stop: float, *, direction: int) -> float:
         if self.cfg.stop_mode == "fixed":
@@ -999,7 +1326,7 @@ class StrategyV13(StrategyBase):
         """
         End-of-run: parse signals -> closed trades; dump JSON with PnL included.
         """
-        import os, json
+        
 
         # Parse signal lines to closed trades (includes PnL_$ and PnL_R)
         try:
@@ -1021,7 +1348,7 @@ class StrategyV13(StrategyBase):
         os.makedirs(dump_dir, exist_ok=True)
         fname = f"StrategyV13_{date}_{sym_label}_{run_label}.json"
 
-        # Dump payload—DO NOT scrub PnL fields
+        # Dump payload DO NOT scrub PnL fields
         payload = {
             "date": date,
             "symbols": syms,
@@ -1029,6 +1356,12 @@ class StrategyV13(StrategyBase):
             "atr_mult": getattr(getattr(self, "config", None), "atr_mult", None),
             "log": list(getattr(self, "_log_lines", []) or []),
             "results": parsed,
+        }
+        payload["trades"] = parsed  # alias for jq/tests
+        payload["summary"] = {
+            "trades": len(parsed),
+            "total_PnL_$": float(sum(t.get("PnL_$", 0) or 0 for t in parsed)),
+            "avg_PnL_R": (sum((t.get("PnL_R") or 0) for t in parsed) / len(parsed)) if parsed else 0.0,
         }
         with open(os.path.join(dump_dir, fname), "w") as f:
             json.dump(payload, f, indent=2)
@@ -1045,6 +1378,11 @@ class StrategyV13(StrategyBase):
             try: return f"{float(x):.4f}"
             except Exception: return str(x)
 
+        # Default fill policy: for exits, use the bar close unless explicitly provided.
+        if tag.startswith("EXIT_") and (extra is None or "fill" not in extra):
+            extra = dict(extra or {})
+            extra["fill"] = f"{float(last['close']):.4f}"
+
         # Strict parity: emit fill=stop for EXIT_STOP, fill=minute close for PARTIAL/other EXIT_*
         if extra is None:
             extra = {}
@@ -1054,10 +1392,7 @@ class StrategyV13(StrategyBase):
             extra.setdefault("fill", f"{float(last['close']):.4f}")
 
         elif tag == "EXIT_STOP":
-            # parity with the old engine across both test days:
-            stop_px  = float(extra.get("stop", last["close"]))
-            close_px = float(last["close"])
-            extra.setdefault("fill", f"{min(stop_px, close_px):.4f}")
+            extra.setdefault("fill", f"{float(last['close']):.4f}")
 
         elif tag.startswith("EXIT_"):
             # other exits: use minute close

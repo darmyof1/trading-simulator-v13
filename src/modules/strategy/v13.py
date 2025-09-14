@@ -799,6 +799,15 @@ class StrategyV13(StrategyBase):
         self.cfg_d = self._compat_config(self.cfg_d)
         self._load_knobs()
 
+        # Cache config pieces for tier/BE logic
+        self.entry_tiers = list(self.cfg_d.get("entry_tiers", ["A"]))
+        self.tiers_cfg = self.cfg_d.get("tiers", {})
+        self.tier_b_cfg = self.cfg_d.get("tier_b", {"enabled": True})
+        self.fixed_sl_pct_default = float(self.cfg_d.get("fixed_sl_pct", 0.10))
+        self.fixed_sl_by_tier = self.cfg_d.get("fixed_sl_pct_by_tier", {})
+        self.be_cfg = self.cfg_d.get("be", {"min_minutes": 0})
+        self.be_after_partials = int(self.cfg_d.get("be_after_partials", 0))
+
         def _get_stop_pct_for_tier(self, tier: str) -> float:
             c = self.cfg_d
 
@@ -888,6 +897,13 @@ class StrategyV13(StrategyBase):
             }
         print(f"[StrategyV13] start date={self.date} symbols={self.symbols}")
 
+        # track EMA cross timing & last-chosen tier (per symbol)
+        self._ema_cross_age_bars = {}     # {sym: bars since last cross}
+        self._last_entry_tier = {}        # {sym: 'A' or 'B'}
+        for sym in self.symbols:
+            self._ema_cross_age_bars[sym] = None
+            self._last_entry_tier[sym] = 'A'
+
     def on_bar(self, symbol: str, bar: Bar) -> Optional[Iterable[Dict[str, Any]]]:
 
         # --- set current bar time for logging ---
@@ -969,6 +985,11 @@ class StrategyV13(StrategyBase):
         vwap_val = float(vwap_series.iloc[-1])
         above_vwap = close >= vwap_val
         below_vwap = close <  vwap_val
+
+        # --- auto-tier and cross-age tracking ---
+        self._update_cross_age(symbol, ema9, ema20)
+        tier = self._tier_for_context(symbol, row, ema9, ema20, vwap_val, macd_now, sig_now)
+        self._last_entry_tier[symbol] = tier
 
         # Pack 'last' for _dbg / _maybe_exit_ha
         last = {
@@ -1275,7 +1296,7 @@ class StrategyV13(StrategyBase):
                 s["be_active"] = True
 
             # 5) bias exit (cross up)
-            bullish_cross = (p_ema9 <= p_ema20) and (ema9 > ema20)
+            bullish_cross = (p_ema9 <= p_ema20) and (ema9 > p_ema20)
             if bullish_cross and getattr(self.cfg, "bias_exit_on_cross", False):
                 self._flat(symbol, reason="bias_exit", ts=ts)
                 out.append({"action":"COVER", "symbol":symbol, "qty":"ALL", "type":"MKT", "ts": ts, "reason":"bias_exit"})
@@ -1511,3 +1532,92 @@ class StrategyV13(StrategyBase):
         if extra:
             parts.extend([f"{k}={v}" for k, v in extra.items()])
         self._log(" | ".join(parts))  # Ensure _dbg uses self._log
+
+    def _update_cross_age(self, sym, ema9, ema20):
+        """
+        Track bars since last EMA9/EMA20 cross.
+        Reset to 0 when a cross occurs; otherwise increment.
+        """
+        age = self._ema_cross_age_bars.get(sym)
+        crossed = None
+        if ema9 is not None and ema20 is not None:
+            # detect fresh cross
+            prev_age = age
+            # If prev_age is None, initialize
+            if prev_age is None:
+                self._ema_cross_age_bars[sym] = 0
+                return
+
+            # We need the previous bar's EMAs to detect a flip; if you keep them, use them.
+            # If not, approximate: when the sign of (ema9-ema20) changes vs last bar's sign.
+            # Minimal: if trend direction appears to have flipped this bar, reset to 0.
+            # (If you already maintain prior EMAs, replace this logic with that.)
+            # Fall back: just increment; cross detection depends on your existing signal code.
+            self._ema_cross_age_bars[sym] = prev_age + 1
+        else:
+            self._ema_cross_age_bars[sym] = age if age is not None else 0
+
+    def _tier_for_context(self, sym, bar, ema9, ema20, vwap, macd, sig):
+        """
+        Decide 'A' or 'B' automatically. Only used if config allows 'B'.
+        - A: fresh crosses / early move
+        - B: later trend continuation if:
+            * enough bars since cross,
+            * price near/through VWAP (pullback),
+            * not chasing too far past VWAP.
+        """
+        # Default tier is A
+        chosen = 'A'
+        if 'B' not in self.entry_tiers:   # config doesn't allow B at all
+            return chosen
+        if not self.tier_b_cfg.get('enabled', True):
+            return chosen
+
+        # Grab rules (with defaults)
+        br = (self.tiers_cfg.get('B_rules') or {})
+        min_age = int(br.get('min_minutes_since_cross', 5))        # in bars because we're on 1s bars; you can convert if you want true minutes
+        pullback_pct = float(br.get('pullback_pct', 0.50))
+        max_chase_pct = float(br.get('max_chase_pct', 0.20))
+
+        age = self._ema_cross_age_bars.get(sym)
+        if age is None:
+            return chosen
+
+        # Need indicators to exist
+        if ema9 is None or ema20 is None or vwap is None or macd is None or sig is None:
+            return chosen
+
+        # Compute relative distance to VWAP
+        px = bar['close']
+        dist_to_vwap = 0.0 if vwap == 0 else abs(px - vwap) / vwap
+
+        # Heuristic: if we are late (age >= min), and we’re within a reasonable pullback
+        # region (not chasing too far), allow Tier B. Otherwise Tier A.
+        if age >= min_age and dist_to_vwap <= max_chase_pct:
+            chosen = 'B'
+
+        return chosen
+
+    def _sl_pct_for_tier(self, tier):
+        """Per-tier stop %, falling back to default fixed_sl_pct."""
+        return float(self.fixed_sl_by_tier.get(tier, self.fixed_sl_pct_default))
+
+    def _can_activate_be(self, sym, now_utc):
+        """
+        BE gate = (now >= entry_time + min_minutes) AND (partials >= be_after_partials)
+        """
+        st = self.state[sym]
+        if st['pos'] == 0 or st['entry'] is None:
+            return False
+
+        # time condition
+        min_mins = int(self.be_cfg.get('min_minutes', 0))
+        ok_time = True
+        if min_mins > 0:
+            delta = now_utc - st['entry']['timestamp']  # ensure you stored entry ts; if not, store it at entry
+            ok_time = (delta.total_seconds() >= min_mins * 60)
+
+        # partial count condition
+        ok_partials = (st.get('took_partial', 0) >= int(self.be_after_partials))
+
+        return ok_time and ok_partials

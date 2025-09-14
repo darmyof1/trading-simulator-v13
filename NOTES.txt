@@ -272,6 +272,6 @@ git push                         # if branch already tracks origin
 git push -u origin <your-branch>
 
 
-git add configs/strategy_v13.json
-git commit -m "Config: A-tier only, 10% SL, BE=2 min & after 2 partials"
+git add .
+git commit -m "parity"
 git push

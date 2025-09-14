@@ -38,27 +38,6 @@ class _LoggerShim:
         msg = " ".join(str(a) for a in args)
         self._sink(msg)
 
-def _compat_config(self, cfg):
-    """Return cfg with legacy/alternate keys mapped so old JSONs work unchanged."""
-    out = dict(cfg)  # shallow copy
-
-    # ---- exits / HA naming compatibility ----
-    # Accept either `ha_exit.enable` or flat `enable_ha_5m`
-    exits = out.setdefault("exits", {})
-    ha_exit = out.get("ha_exit", {})
-    if "enable" in ha_exit:
-        exits["enable_ha_5m"] = bool(ha_exit.get("enable"))
-    if "enable_ha_5m" in out:
-        exits["enable_ha_5m"] = bool(out["enable_ha_5m"])
-
-    # ---- balance / equity compatibility ----
-    rr = out.setdefault("risk_rules", {})
-    # Use dynamic cash by default; fall back to EQUITY or risk_rules.account_balance
-    use_dyn = out.get("USE_DYNAMIC_CASH", True)
-    if use_dyn:
-        rr.setdefault("account_balance", float(out.get("EQUITY", rr.get("account_balance", 25000))))
-
-    return out
 
 def _load_knobs(self):
     c = self.cfg_d
@@ -779,6 +758,29 @@ class StrategyV13(StrategyBase):
             if remaining <= 0:
                 break
 
+    def _compat_config(self, cfg):
+        """Return cfg with legacy/alternate keys mapped so old JSONs work unchanged."""
+        out = dict(cfg)  # shallow copy
+
+        # ---- exits / HA naming compatibility ----
+        # Accept either `ha_exit.enable` or flat `enable_ha_5m`
+        exits = out.setdefault("exits", {})
+        ha_exit = out.get("ha_exit", {})
+        if "enable" in ha_exit:
+            exits["enable_ha_5m"] = bool(ha_exit.get("enable"))
+        if "enable_ha_5m" in out:
+            exits["enable_ha_5m"] = bool(out["enable_ha_5m"])
+
+        # ---- balance / equity compatibility ----
+        rr = out.setdefault("risk_rules", {})
+        # Use dynamic cash by default; fall back to EQUITY or risk_rules.account_balance
+        use_dyn = out.get("USE_DYNAMIC_CASH", True)
+        if use_dyn:
+            rr.setdefault("account_balance", float(out.get("EQUITY", rr.get("account_balance", 25000))))
+
+        return out
+
+
     def on_start(self, ctx=None, *args, date=None, symbols=None, **kwargs):
         """
         Called by the runner before the backtest/stream begins.
@@ -869,7 +871,11 @@ class StrategyV13(StrategyBase):
         # pull from JSON (no hard-coded window here)
         self.entry_window_spec = self.cfg_d.get("entry_window", None)
         self.tz_name = self.cfg_d.get("timezone", "US/Eastern")
-
+        # --- stops: fixed SL global + per-tier map ---
+        self.stop_mode = self.cfg_d.get("stop_mode", getattr(self, "stop_mode", "fixed"))
+        self.fixed_sl_pct_global = float(self.cfg_d.get("fixed_sl_pct", 0.10))
+        _fsp_map = self.cfg_d.get("fixed_sl_pct_by_tier", {})
+        self.fixed_sl_pct_by_tier = {str(k).upper(): float(v) for k, v in _fsp_map.items()} if _fsp_map else {}
         # one-time helpers/containers
         self.ha5m = HA5m()
         self.buffers = {}
@@ -903,6 +909,18 @@ class StrategyV13(StrategyBase):
         for sym in self.symbols:
             self._ema_cross_age_bars[sym] = None
             self._last_entry_tier[sym] = 'A'
+
+    def _get_sl_pct_for_tier(self, tier: str | None) -> float:
+        """
+        Return the fixed stop-loss percent for the given tier, falling back to global.
+        Only relevant when stop_mode == 'fixed'.
+        """
+        if self.stop_mode != "fixed":
+            # caller should ignore and use ATR/etc.
+            return None
+        key = (tier or "A").upper()
+        return self.fixed_sl_pct_by_tier.get(key, self.fixed_sl_pct_global)
+
 
     def on_bar(self, symbol: str, bar: Bar) -> Optional[Iterable[Dict[str, Any]]]:
 
@@ -1048,24 +1066,15 @@ class StrategyV13(StrategyBase):
 
                 if long_ok and can_long:
                     entry = close
-                    # --- Tier-aware stop-loss logic ---
-                    tier = getattr(self, "_last_entry_tier", "A")  # set by your signal code
-                    sl_mode = self.cfg_d.get("stop_mode", "fixed")
-                    if sl_mode == "tier_map":
-                        sl_pct = float(self.cfg_d.get("tier_sl_pct", {}).get(tier, self.cfg_d.get("fixed_sl_pct", 0.10)))
-                    elif sl_mode == "fixed":
-                        sl_pct = float(self.cfg_d.get("fixed_sl_pct", 0.10))
+                    tier = getattr(self, "_last_entry_tier", "A")
+                    sl_pct = self._get_sl_pct_for_tier(tier) if self.stop_mode == "fixed" else None
+                    if self.stop_mode == "fixed":
+                        stop = entry * (1.0 - sl_pct)
                     else:
-                        # (optional) ATR path if you support it elsewhere
-                        sl_pct = float(self.cfg_d.get("fixed_sl_pct", 0.10))
-
-                    stop = entry * (1.0 - sl_pct)
-                    r     = max(1e-9, entry - stop)
-                    # Decide sizing tier for this entry
-                    self._last_entry_tier = "A"   # cross-based long = Tier A
-                    size  = self._compute_position_size(entry=entry, stop=stop, direction=+1)
+                        stop, _ = self._initial_stop(entry, atrv, direction=+1)
+                    size = self._compute_position_size(entry=entry, stop=stop, direction=+1)
                     s.update({
-                        "pos": +1, "entry": entry, "stop": stop, "r": r,
+                        "pos": +1, "entry": entry, "stop": stop, "r": max(1e-9, entry - stop),
                         "size": size, "orig_size": size, "took_partial": 0, "be_active": False,
                         "side": "BUY", "symbol": symbol, "best": entry
                     })
@@ -1074,29 +1083,20 @@ class StrategyV13(StrategyBase):
                     out.append({"action":"BUY", "symbol":symbol, "qty":size, "type":"MKT",
                                 "ts": ts, "entry": entry, "stop": stop,
                                 "reason":"ema9>ema20 + macd>sig" + (" + vwap" if getattr(self.cfg, "vwap_filter", False) else "")})
-                    self._dbg(symbol, last, tag="BUY", extra={"entry": f"{entry:.4f}", "stop": f"{stop:.4f}", "R": f"{r:.4f}", "size": size})
+                    self._dbg(symbol, last, tag="BUY", extra={"entry": f"{entry:.4f}", "stop": f"{stop:.4f}", "R": f"{entry-stop:.4f}", "size": size})
                     return out
 
                 if short_ok and can_short:
                     entry = close
-                    # --- Tier-aware stop-loss logic ---
-                    tier = getattr(self, "_last_entry_tier", "A")  # set by your signal code
-                    sl_mode = self.cfg_d.get("stop_mode", "fixed")
-                    if sl_mode == "tier_map":
-                        sl_pct = float(self.cfg_d.get("tier_sl_pct", {}).get(tier, self.cfg_d.get("fixed_sl_pct", 0.10)))
-                    elif sl_mode == "fixed":
-                        sl_pct = float(self.cfg_d.get("fixed_sl_pct", 0.10))
+                    tier = getattr(self, "_last_entry_tier", "A")
+                    sl_pct = self._get_sl_pct_for_tier(tier) if self.stop_mode == "fixed" else None
+                    if self.stop_mode == "fixed":
+                        stop = entry * (1.0 + sl_pct)
                     else:
-                        # (optional) ATR path if you support it elsewhere
-                        sl_pct = float(self.cfg_d.get("fixed_sl_pct", 0.10))
-
-                    stop = entry * (1.0 + sl_pct)
-                    r     = max(1e-9, stop - entry)
-                    # Decide sizing tier for this entry
-                    self._last_entry_tier = "A"   # cross-based short = Tier A
-                    size  = self._compute_position_size(entry=entry, stop=stop, direction=-1)
+                        stop, _ = self._initial_stop(entry, atrv, direction=-1)
+                    size = self._compute_position_size(entry=entry, stop=stop, direction=-1)
                     s.update({
-                        "pos": -1, "entry": entry, "stop": stop, "r": r,
+                        "pos": -1, "entry": entry, "stop": stop, "r": max(1e-9, stop - entry),
                         "size": size, "orig_size": size, "took_partial": 0, "be_active": False,
                         "side": "SELL_SHORT", "symbol": symbol, "best": entry
                     })
@@ -1105,11 +1105,8 @@ class StrategyV13(StrategyBase):
                     out.append({"action":"SELL_SHORT", "symbol":symbol, "qty":size, "type":"MKT",
                                 "ts": ts, "entry": entry, "stop": stop,
                                 "reason":"ema9<ema20 + macd<sig" + (" + vwap" if getattr(self.cfg, "vwap_filter", False) else "")})
-                    self._dbg(symbol, last, tag="SELL_SHORT", extra={"entry": f"{entry:.4f}", "stop": f"{stop:.4f}", "R": f"{r:.4f}", "size": size})
+                    self._dbg(symbol, last, tag="SELL_SHORT", extra={"entry": f"{entry:.4f}", "stop": f"{stop:.4f}", "R": f"{stop-entry:.4f}", "size": size})
                     return out
-
-            return None  # stayed flat
-
         # ---------- manage LONG ----------
         if s["pos"] == +1:
             entry = float(s["entry"]); stop = float(s["stop"])

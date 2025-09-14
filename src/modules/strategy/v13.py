@@ -1085,7 +1085,7 @@ class StrategyV13(StrategyBase):
 
             if can_enter:
                 # reset any previous tier flag for this evaluation
-                self._last_entry_tier = None
+                self._last_entry_tier.pop(symbol, None)
                 # LONG signal
                 bullish_cross = (p_ema9 <= p_ema20) and (ema9 > ema20)
                 long_ok = bullish_cross and (macd_now > sig_now)

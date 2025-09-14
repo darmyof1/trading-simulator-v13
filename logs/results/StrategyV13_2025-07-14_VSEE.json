@@ -11,6 +11,6 @@
     "[PARTIAL DEBUG] lvl=1 mv=0.0050 orig=567 sold_so_far=0 desired_cum=142 to_sell=142",
     "[PARTIAL DEBUG] lvl=2 mv=0.0100 orig=567 sold_so_far=142 desired_cum=284 to_sell=142",
     "[PARTIAL DEBUG] lvl=3 mv=0.0200 orig=567 sold_so_far=284 desired_cum=567 to_sell=283",
-    "[PARTIAL DEBUG] lvl=1 mv=0.0050 orig=348 sold_so_far=0 desired_cum=87 to_sell=87"
+    "w[PARTIAL DEBUG] lvl=1 mv=0.0050 orig=348 sold_so_far=0 desired_cum=87 to_sell=87"
   ]
 }

@@ -780,6 +780,53 @@ class StrategyV13(StrategyBase):
 
         return out
 
+    def _load_knobs(self):
+        """Normalize config dict into attributes the strategy uses at runtime."""
+        cfg = self.cfg_d
+
+        # --- stops / tiers ---
+        self.stop_mode = cfg.get("stop_mode", "fixed")
+        self.fixed_sl_pct = float(cfg.get("fixed_sl_pct", 0.10))
+        self.fixed_sl_pct_by_tier = {k: float(v) for k, v in cfg.get("fixed_sl_pct_by_tier", {}).items()}
+
+        tiers_cfg = cfg.get("tiers", {})
+        # Enabled tiers (fallback to entry_tiers if present)
+        self.enabled_tiers = list(tiers_cfg.get("enable", cfg.get("entry_tiers", ["A"])))
+        tb = cfg.get("tier_b", {})
+        # Tier B is considered enabled if json says so, or if "B" is in enabled list
+        self.tier_b_enabled = bool(tb.get("enabled", ("B" in self.enabled_tiers)))
+        # Optional B timing rules (defaults keep parity benign when B is disabled)
+        self.tier_b_rules = {
+            "min_age_bars": int(tb.get("min_age_bars", 30)),
+            "max_age_bars": int(tb.get("max_age_bars", 240)),
+        }
+
+        # --- sizing / risk ---
+        self.use_risk_sizing = bool(cfg.get("use_risk_sizing", True))
+        self.risk_rules = dict(cfg.get("risk_rules", {}))
+
+        # --- BE / ratchet / exits / partials ---
+        self.be_rules = dict(cfg.get("be", {"min_minutes": 0}))
+        self.be_after_partials = int(cfg.get("be_after_partials", 0))
+        self.ratchet_cfg = dict(cfg.get("ratchet", {"enable": False, "levels": []}))
+        self.ha_exit_cfg = dict(cfg.get("ha_exit", cfg.get("exits", {})))
+        self.partial_levels = list(cfg.get("partial_levels", []))
+        self.partial_one_per_bar = bool(cfg.get("partial_one_per_bar", True))
+
+        # --- misc knobs (kept for parity) ---
+        self.vwap_filter = bool(cfg.get("vwap_filter", True))
+        self.allow_shorts = bool(cfg.get("allow_shorts", True))
+        self.trace_every_n = int(cfg.get("trace_every_n", 5))
+        self.min_size = int(cfg.get("min_size", 1))
+        self.max_size = int(cfg.get("max_size", 1000))
+        self.lot_size = int(cfg.get("lot_size", 1))
+        self.base_size = float(cfg.get("base_size", 4))
+
+    def get_sl_pct_for_tier(self, tier: str) -> float:
+        """Return stop-loss % for a given tier, honoring fixed_sl_pct_by_tier with fallback to fixed_sl_pct."""
+        if hasattr(self, "fixed_sl_pct_by_tier") and tier in self.fixed_sl_pct_by_tier:
+            return float(self.fixed_sl_pct_by_tier[tier])
+        return float(getattr(self, "fixed_sl_pct", 0.10))
 
     def on_start(self, ctx=None, *args, date=None, symbols=None, **kwargs):
         """
@@ -1067,11 +1114,8 @@ class StrategyV13(StrategyBase):
                 if long_ok and can_long:
                     entry = close
                     tier = getattr(self, "_last_entry_tier", "A")
-                    sl_pct = self._get_sl_pct_for_tier(tier) if self.stop_mode == "fixed" else None
-                    if self.stop_mode == "fixed":
-                        stop = entry * (1.0 - sl_pct)
-                    else:
-                        stop, _ = self._initial_stop(entry, atrv, direction=+1)
+                    sl_pct = self.get_sl_pct_for_tier(tier)
+                    stop = entry * (1.0 - sl_pct)
                     size = self._compute_position_size(entry=entry, stop=stop, direction=+1)
                     s.update({
                         "pos": +1, "entry": entry, "stop": stop, "r": max(1e-9, entry - stop),
@@ -1089,11 +1133,8 @@ class StrategyV13(StrategyBase):
                 if short_ok and can_short:
                     entry = close
                     tier = getattr(self, "_last_entry_tier", "A")
-                    sl_pct = self._get_sl_pct_for_tier(tier) if self.stop_mode == "fixed" else None
-                    if self.stop_mode == "fixed":
-                        stop = entry * (1.0 + sl_pct)
-                    else:
-                        stop, _ = self._initial_stop(entry, atrv, direction=-1)
+                    sl_pct = self.get_sl_pct_for_tier(tier)
+                    stop = entry * (1.0 + sl_pct)
                     size = self._compute_position_size(entry=entry, stop=stop, direction=-1)
                     s.update({
                         "pos": -1, "entry": entry, "stop": stop, "r": max(1e-9, stop - entry),

@@ -38,6 +38,51 @@ class _LoggerShim:
         msg = " ".join(str(a) for a in args)
         self._sink(msg)
 
+def _compat_config(self, cfg):
+    """Return cfg with legacy/alternate keys mapped so old JSONs work unchanged."""
+    out = dict(cfg)  # shallow copy
+
+    # ---- exits / HA naming compatibility ----
+    # Accept either `ha_exit.enable` or flat `enable_ha_5m`
+    exits = out.setdefault("exits", {})
+    ha_exit = out.get("ha_exit", {})
+    if "enable" in ha_exit:
+        exits["enable_ha_5m"] = bool(ha_exit.get("enable"))
+    if "enable_ha_5m" in out:
+        exits["enable_ha_5m"] = bool(out["enable_ha_5m"])
+
+    # ---- balance / equity compatibility ----
+    rr = out.setdefault("risk_rules", {})
+    # Use dynamic cash by default; fall back to EQUITY or risk_rules.account_balance
+    use_dyn = out.get("USE_DYNAMIC_CASH", True)
+    if use_dyn:
+        rr.setdefault("account_balance", float(out.get("EQUITY", rr.get("account_balance", 25000))))
+
+    return out
+
+def _load_knobs(self):
+    c = self.cfg_d
+
+    # General toggles / limits
+    self.allow_reentry_after_be = bool(c.get("allow_reentry_after_be", True))
+    self.max_trades_per_dir     = int(c.get("max_trades_per_dir", 1))
+    self.base_size              = float(c.get("base_size", 1.0))
+    self.atr_mult               = float(c.get("atr_mult", 2.0))
+    self.min_trade_amount       = float(c.get("MIN_TRADE_AMOUNT", 0.0))
+    self.debug_signals          = bool(c.get("debug_signals", False))
+
+    # Entry / window / timezone (already in your file)
+    self.entry_window_spec      = c.get("entry_window", None)
+    self.tz_name                = c.get("timezone", "US/Eastern")
+    self.bridge_boundary        = c.get("bridge_boundary", "09:15:00")
+
+    # Break-even rules
+    be_d = c.get("be", {}) or {}
+    self.be_min_minutes         = int(be_d.get("min_minutes", 2))
+    self.be_after_partials      = int(c.get("be_after_partials", 2))
+
+    # Ratchet + HA exits are already read via cfg; exits.enable_ha_5m honored via _compat_config
+
     # allow self._log.info("..."), .debug("..."), etc.
     def info(self, *args, **kwargs):  self(*args, **kwargs)
     def debug(self, *args, **kwargs): self(*args, **kwargs)
@@ -749,6 +794,31 @@ class StrategyV13(StrategyBase):
         if self.ctx is not None:
             self.date = getattr(self.ctx, "date", self.date)
             self.symbols = list(getattr(self.ctx, "symbols", self.symbols))
+        
+        # --- CONFIG COMPATIBILITY AND KNOB LOAD ---
+        self.cfg_d = self._compat_config(self.cfg_d)
+        self._load_knobs()
+
+        def _get_stop_pct_for_tier(self, tier: str) -> float:
+            c = self.cfg_d
+
+            # 1) explicit map takes precedence
+            by_tier = c.get("fixed_sl_pct_by_tier")
+            if isinstance(by_tier, dict) and tier in by_tier:
+                return float(by_tier[tier])
+
+            # 2) legacy names from old script
+            if tier == "A" and "highProbSLPct" in c:
+                return float(c["highProbSLPct"])
+            if tier == "B" and "lowProbSLPct" in c:
+                return float(c["lowProbSLPct"])
+
+            # 3) single fixed value
+            if "fixed_sl_pct" in c:
+                return float(c["fixed_sl_pct"])
+
+            # 4) hard defaults matching old script expectations
+            return 0.10 if tier == "A" else 0.05
 
         # Ensure log buffer exists
         if not hasattr(self, "_log_lines"):

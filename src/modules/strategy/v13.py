@@ -318,8 +318,29 @@ def parse_sig_loglines_to_trades(log_lines):
 Bar = Dict[str, Any]
 
 class StrategyV13(StrategyBase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._last_entry_tier: Dict[str, int] = {}          # symbol -> int tier
+        self._last_entry_time = {}
+        self._entry_price_by_symbol = {}
+        cfg = getattr(self, "config", {}) or {}
+        raw = cfg.get("fixed_sl_pct_by_tier", {})
+        self.fixed_sl_pct_by_tier: Dict[int, float] = {int(k): float(v) for k, v in raw.items()}
 
-    import logging
+    def get_sl_pct_for_tier(self, tier: int) -> float:
+        tier_id = self._as_tier_id(tier)
+        if self.fixed_sl_pct_by_tier:
+            return self.fixed_sl_pct_by_tier.get(tier_id, self.fixed_sl_pct_by_tier.get(-1, 0.0))
+        return float(getattr(self, "fixed_sl_pct", 0.10))
+
+    def _as_tier_id(self, tier) -> Optional[int]:
+        if isinstance(tier, dict):
+            return int(tier.get("tier") or tier.get("id"))
+        return int(tier) if tier is not None else None
+
+    def _ensure_state(self):
+        if not isinstance(self._last_entry_tier, dict):
+            self._last_entry_tier = {}
 
     def _compute_position_size(self, entry: float, stop: float, direction: int) -> float:
         """
@@ -822,10 +843,16 @@ class StrategyV13(StrategyBase):
         self.lot_size = int(cfg.get("lot_size", 1))
         self.base_size = float(cfg.get("base_size", 4))
 
-    def get_sl_pct_for_tier(self, tier: str) -> float:
-        """Return stop-loss % for a given tier, honoring fixed_sl_pct_by_tier with fallback to fixed_sl_pct."""
-        if hasattr(self, "fixed_sl_pct_by_tier") and tier in self.fixed_sl_pct_by_tier:
-            return float(self.fixed_sl_pct_by_tier[tier])
+    def _as_tier_id(self, tier):
+        # Accept int/str or dict payloads
+        if isinstance(tier, dict):
+            return int(tier.get("tier") or tier.get("id"))
+        return int(tier) if tier is not None else None
+
+    def get_sl_pct_for_tier(self, tier):
+        tier_id = self._as_tier_id(tier)
+        if self.fixed_sl_pct_by_tier:
+            return self.fixed_sl_pct_by_tier.get(tier_id, self.fixed_sl_pct_by_tier.get(-1, 0.0))
         return float(getattr(self, "fixed_sl_pct", 0.10))
 
     def on_start(self, ctx=None, *args, date=None, symbols=None, **kwargs):
@@ -913,8 +940,8 @@ class StrategyV13(StrategyBase):
         self.results_run_label = self.cfg_d.get("results_run_label", getattr(self, "results_run_label", "run"))
 
         # Load tier-specific stop percent mapping if present
-        self.fixed_sl_by_tier = dict(self.cfg_d.get("fixed_sl_pct_by_tier", {}))
-
+        _fsp_map = self.cfg_d.get("fixed_sl_pct_by_tier", {})
+        self.fixed_sl_pct_by_tier = {int(k): float(v) for k, v in _fsp_map.items()} if _fsp_map else {}
         # pull from JSON (no hard-coded window here)
         self.entry_window_spec = self.cfg_d.get("entry_window", None)
         self.tz_name = self.cfg_d.get("timezone", "US/Eastern")
@@ -955,21 +982,11 @@ class StrategyV13(StrategyBase):
         self._last_entry_tier = {}        # {sym: 'A' or 'B'}
         for sym in self.symbols:
             self._ema_cross_age_bars[sym] = None
-            self._last_entry_tier[sym] = 'A'
-
-    def _get_sl_pct_for_tier(self, tier: str | None) -> float:
-        """
-        Return the fixed stop-loss percent for the given tier, falling back to global.
-        Only relevant when stop_mode == 'fixed'.
-        """
-        if self.stop_mode != "fixed":
-            # caller should ignore and use ATR/etc.
-            return None
-        key = (tier or "A").upper()
-        return self.fixed_sl_pct_by_tier.get(key, self.fixed_sl_pct_global)
-
+            self._last_entry_tier[sym] = 1  # default to int tier 1
 
     def on_bar(self, symbol: str, bar: Bar) -> Optional[Iterable[Dict[str, Any]]]:
+
+        self._ensure_state()
 
         # --- set current bar time for logging ---
         ts = getattr(bar, "ts", None)
@@ -1053,8 +1070,11 @@ class StrategyV13(StrategyBase):
 
         # --- auto-tier and cross-age tracking ---
         self._update_cross_age(symbol, ema9, ema20)
-        tier = self._tier_for_context(symbol, row, ema9, ema20, vwap_val, macd_now, sig_now)
-        self._last_entry_tier[symbol] = tier
+        tier_raw = self._tier_for_context(symbol, row, ema9, ema20, vwap_val, macd_now, sig_now)
+        tier_id = self._as_tier_id(tier_raw)
+        if tier_id is None:
+            return  # or skip entry
+        self._last_entry_tier[symbol] = tier_id
 
         # Pack 'last' for _dbg / _maybe_exit_ha
         last = {
@@ -1113,8 +1133,7 @@ class StrategyV13(StrategyBase):
 
                 if long_ok and can_long:
                     entry = close
-                    tier = getattr(self, "_last_entry_tier", "A")
-                    sl_pct = self.get_sl_pct_for_tier(tier)
+                    sl_pct = self.get_sl_pct_for_tier(tier_id)
                     stop = entry * (1.0 - sl_pct)
                     size = self._compute_position_size(entry=entry, stop=stop, direction=+1)
                     s.update({
@@ -1132,8 +1151,7 @@ class StrategyV13(StrategyBase):
 
                 if short_ok and can_short:
                     entry = close
-                    tier = getattr(self, "_last_entry_tier", "A")
-                    sl_pct = self.get_sl_pct_for_tier(tier)
+                    sl_pct = self.get_sl_pct_for_tier(tier_id)
                     stop = entry * (1.0 + sl_pct)
                     size = self._compute_position_size(entry=entry, stop=stop, direction=-1)
                     s.update({
@@ -1475,8 +1493,10 @@ class StrategyV13(StrategyBase):
 
     def _flat(self, symbol: str, *, reason: str, ts: pd.Timestamp) -> None:
         self.state[symbol].update({
+           
             "pos": 0, "entry": None, "stop": None, "r": None, "size": 0,
             "took_partial": 0, "be_active": False
+
         })
 
     def on_end(self, *_, **__):
@@ -1635,27 +1655,3 @@ class StrategyV13(StrategyBase):
             chosen = 'B'
 
         return chosen
-
-    def _sl_pct_for_tier(self, tier):
-        """Per-tier stop %, falling back to default fixed_sl_pct."""
-        return float(self.fixed_sl_by_tier.get(tier, self.fixed_sl_pct_default))
-
-    def _can_activate_be(self, sym, now_utc):
-        """
-        BE gate = (now >= entry_time + min_minutes) AND (partials >= be_after_partials)
-        """
-        st = self.state[sym]
-        if st['pos'] == 0 or st['entry'] is None:
-            return False
-
-        # time condition
-        min_mins = int(self.be_cfg.get('min_minutes', 0))
-        ok_time = True
-        if min_mins > 0:
-            delta = now_utc - st['entry']['timestamp']  # ensure you stored entry ts; if not, store it at entry
-            ok_time = (delta.total_seconds() >= min_mins * 60)
-
-        # partial count condition
-        ok_partials = (st.get('took_partial', 0) >= int(self.be_after_partials))
-
-        return ok_time and ok_partials

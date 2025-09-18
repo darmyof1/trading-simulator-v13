@@ -1,0 +1,108 @@
+[CONFIG] entry_window={'start': '09:30', 'end': '13:15'}   2025-07-14T13:30:00+00:00 2025-07-14T17:15:00+00:00
+[TRACE] sig | long_ok=False short_ok=False vwap_filter=True allow_shorts=True ema9=1.5643 ema20=1.5530 macd=0.0098 sig=0.0062 vwap=1.6474
+[TRACE] sig | long_ok=False short_ok=False vwap_filter=True allow_shorts=True ema9=1.5575 ema20=1.5508 macd=0.0066 sig=0.0063 vwap=1.6455
+[TRACE] sig | long_ok=False short_ok=False vwap_filter=True allow_shorts=True ema9=1.5480 ema20=1.5469 macd=0.0025 sig=0.0055 vwap=1.6446
+[TRACE] sig | long_ok=False short_ok=True vwap_filter=True allow_shorts=True ema9=1.5304 ema20=1.5386 macd=-0.0048 sig=0.0035 vwap=1.6432
+[SIG] SELL_SHORT | sym=VSEE | ts=2025-07-14T13:33:00+00:00 | close=1.4600 | ema9=1.5304 | ema20=1.5386 | macd=-0.0048 | sig=0.0035 | vwap=1.6432 | atr=0.0476 | entry=1.4600 | stop=1.6060 | R=0.1460 | size=6849.315068493151
+[INFO] STOP_UPDATE | sym=VSEE | ts=2025-07-14T13:34:00+00:00 | from=1.6060 -> 1.4352 | reason=ratchet_4.0%
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/Users/rsanchez/Desktop/Command & Control/Finance/Tools/Trading Simulator/src/modules/backtest/runner.py", line 202, in <module>
+    main()
+    ~~~~^^
+  File "/Users/rsanchez/Desktop/Command & Control/Finance/Tools/Trading Simulator/src/modules/backtest/runner.py", line 190, in main
+    run_backtest(
+    ~~~~~~~~~~~~^
+        strategy_cls=strategy_cls,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<6 lines>...
+        session=args.sessions,
+        ^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/rsanchez/Desktop/Command & Control/Finance/Tools/Trading Simulator/src/modules/backtest/runner.py", line 123, in run_backtest
+    strat.on_bar(sym, bar)
+    ~~~~~~~~~~~~^^^^^^^^^^
+  File "/Users/rsanchez/Desktop/Command & Control/Finance/Tools/Trading Simulator/src/modules/strategy/v13.py", line 1353, in on_bar
+    self._apply_ratchet(symbol, s, close, ts)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+TypeError: StrategyV13._apply_ratchet() missing 2 required positional arguments: 'trigger_move_pct' and 'cushion_pct'
+[StrategyV13] start date=2025-07-14 symbols=['VSEE']
+[TRACE] gate | ts=2025-07-14 12:17:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:18:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:19:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:20:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:21:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:22:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:23:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:24:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:25:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:26:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:27:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:28:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:29:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:30:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:31:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:32:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:33:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:34:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:35:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:36:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:37:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:38:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:39:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:40:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:41:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:42:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:43:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:44:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:45:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:46:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:47:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:48:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:49:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:50:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:51:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:52:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:53:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:54:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:55:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:56:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:57:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:58:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 12:59:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:00:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:01:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:02:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:03:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:04:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:05:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:06:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:07:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:08:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:09:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:10:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:11:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:12:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:13:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:14:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:15:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:16:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:17:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:18:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:19:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:20:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:21:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:22:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:23:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:24:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:25:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:26:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:27:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:28:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:29:00+00:00 | can_enter=False
+[TRACE] gate | ts=2025-07-14 13:30:00+00:00 | can_enter=True
+[TRACE] gate | ts=2025-07-14 13:31:00+00:00 | can_enter=True
+[TRACE] gate | ts=2025-07-14 13:32:00+00:00 | can_enter=True
+[TRACE] gate | ts=2025-07-14 13:33:00+00:00 | can_enter=True

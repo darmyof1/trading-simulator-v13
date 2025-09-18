@@ -38,7 +38,7 @@
   "exits": {
     "enable_ha_5m": true
   },
-  "results_dump_path": "logs/results/",
+  "results_dump_path": "logs/results",
   "results_run_label": "risk",
   "debug_signals": true,
   

@@ -219,8 +219,22 @@ def parse_sig_loglines_to_trades(log_lines):
         rps = t["rps"] if t["rps"] and t["rps"] > 0 else 1e-9
         r_mult = pnl / (rps * max(t["size"], 1))
         exit_causes = []
+        normalized_cause = cause
         if cause:
-            exit_causes = [cause if cause.startswith("EXIT_") else f"EXIT_{cause}"]
+            if cause == "all_partials_exit":
+                normalized_cause = "EXIT_ALL_PARTIALS"
+            elif cause.startswith("EXIT_"):
+                normalized_cause = cause
+            else:
+                normalized_cause = f"EXIT_{cause}"
+            exit_causes = [normalized_cause]
+
+        # Set exit_price to last partial fill if remaining==0
+        exit_price = fill_price
+        if t["remaining"] == 0 and t["partials"]:
+            exit_price = t["partials"][-1][1]
+            normalized_cause = "EXIT_ALL_PARTIALS"
+            exit_causes = [normalized_cause]
 
         closed.append({
             "symbol": t["symbol"],
@@ -231,6 +245,9 @@ def parse_sig_loglines_to_trades(log_lines):
             "PnL_$": safe_round(pnl),
             "PnL_R": safe_round(r_mult),
             "exit_causes": exit_causes,
+            "entry_price": t["entry"],
+            "exit_price": exit_price,
+            "exit_cause": normalized_cause,
         })
         open_trades.pop(sym, None)
 
@@ -470,6 +487,25 @@ class StrategyV13(StrategyBase):
                             "ts": ts, "reason": "exit_ha_5m"})
                 self._flat(symbol, reason="exit_ha_5m", ts=ts)
                 return out
+
+            # Timeout exit (after HA override)
+            tier = self._last_entry_tier.get(symbol, "B")
+            timeout_min = self._timeout_minutes_for_tier(tier)
+            ha_cfg = getattr(self, "cfg_d", {}).get("ha_exit", {})
+            override_timeout = ha_cfg.get("override_timeout", ha_cfg.get("HA_OVERRIDES_TIMEOUT", False))
+            moved = (float(s["entry"]) - low) / float(s["entry"]) if s["entry"] else 0.0
+            tp_pct = getattr(self, "tp_pct", 0.0)
+            tp_ok = moved >= tp_pct if tp_pct > 0 else False
+            ha5m_bar = getattr(self, "ha5m", None)
+            ha_favors_short = False
+            if ha5m_bar and hasattr(ha5m_bar, "prev_ha_open") and ha5m_bar.prev_ha_open is not None:
+                ha_favors_short = ha5m_bar.prev_ha_close < ha5m_bar.prev_ha_open
+            if timeout_min > 0 and self._elapsed_minutes(s, ts) >= timeout_min:
+                if not (override_timeout and tp_ok and ha_favors_short):
+                    out.append({"action": "COVER", "symbol": symbol, "qty": "ALL", "type": "MKT",
+                                "ts": ts, "reason": f"timeout_{timeout_min}min"})
+                    self._flat(symbol, reason=f"timeout_{timeout_min}min", ts=ts)
+                    return out
 
             # Management helpers
             # --- Safer BE/trailing logic for SHORT ---
@@ -1195,31 +1231,28 @@ class StrategyV13(StrategyBase):
                     self._log(
                         f"[TRACE] sig | long_ok={long_ok} short_ok={short_ok} "
                         f"vwap_filter={getattr(self.cfg, 'vwap_filter', False)} "
-                        f"allow_shorts={allow_shorts} "
-                        f"ema9={ema9:.4f} ema20={ema20:.4f} macd={macd_now:.4f} sig={sig_now:.4f} vwap={vwap_val:.4f}"
+                        f"allow_shorts={allow_shorts}"
                     )
 
-                if long_ok and can_long:
-                    entry = close
-                    # self._last_entry_tier[symbol] = "A"  # redundant, already set by auto-tier
-                    sl_pct = self.get_sl_pct_for_tier("A")
-                    stop = entry * (1.0 - sl_pct)
-                    size = self._compute_position_size(symbol=symbol, entry=entry, stop=stop, direction=+1)
-                    s.update({
-                        "pos": +1, "entry": entry, "stop": stop, "r": max(1e-9, entry - stop),
-                        "size": size, "orig_size": size, "took_partial": 0, "be_active": False,
-                        "side": "BUY", "symbol": symbol, "best": entry
+                    s["entries_long"] += 1
+                    out.append({
+                        "action": "BUY", "symbol": symbol, "qty": size, "type": "MKT",
+                        "ts": ts, "entry": entry, "stop": stop,
+                        "reason": "ema9>ema20 + macd>sig" + (
+                            " + vwap" if getattr(self.cfg, "vwap_filter", False) else ""
+                        )
                     })
-                    if s.get("allow_reentry_long"): s["allow_reentry_long"] = False
-                    else: s["entries_long"] += 1
-                    out.append({"action":"BUY", "symbol":symbol, "qty":size, "type":"MKT",
-                                "ts": ts, "entry": entry, "stop": stop,
-                                "reason":"ema9>ema20 + macd>sig" + (" + vwap" if getattr(self.cfg, "vwap_filter", False) else "")})
-                    self._dbg(symbol, last, tag="BUY", extra={"entry": f"{entry:.4f}", "stop": f"{stop:.4f}", "R": f"{entry-stop:.4f}", "size": size})
+                    self._dbg(
+                        symbol, last, tag="BUY",
+                        extra={
+                            "entry": f"{entry:.4f}", "stop": f"{stop:.4f}",
+                            "R": f"{entry - stop:.4f}", "size": size
+                        }
+                    )
                     return out
 
                 if short_ok and can_short:
-                    entry = close
+                    entry = fill_price
                     # self._last_entry_tier[symbol] = "B"  # redundant, already set by auto-tier
                     sl_pct = self.get_sl_pct_for_tier("B")
                     stop = entry * (1.0 + sl_pct)
@@ -1247,6 +1280,25 @@ class StrategyV13(StrategyBase):
                 self._flat(symbol, reason="exit_ha_5m", ts=ts)
                 return out
 
+            # Timeout exit (after HA override)
+            tier = self._last_entry_tier.get(symbol, "A")
+            timeout_min = self._timeout_minutes_for_tier(tier)
+            ha_cfg = getattr(self, "cfg_d", {}).get("ha_exit", {})
+            override_timeout = ha_cfg.get("override_timeout", ha_cfg.get("HA_OVERRIDES_TIMEOUT", False))
+            moved = (high - float(s["entry"])) / float(s["entry"]) if s["entry"] else 0.0
+            tp_pct = getattr(self, "tp_pct", 0.0)
+            tp_ok = moved >= tp_pct if tp_pct > 0 else False
+            # Get last closed 5m HA bar
+            ha5m_bar = getattr(self, "ha5m", None)
+            ha_favors_long = False
+            if ha5m_bar and hasattr(ha5m_bar, "prev_ha_open") and ha5m_bar.prev_ha_open is not None:
+                ha_favors_long = ha5m_bar.prev_ha_close > ha5m_bar.prev_ha_open
+            if timeout_min > 0 and self._elapsed_minutes(s, ts) >= timeout_min:
+                if not (override_timeout and tp_ok and ha_favors_long):
+                    out.append({"action": "SELL", "symbol": symbol, "qty": "ALL", "type": "MKT",
+                                "ts": ts, "reason": f"timeout_{timeout_min}min"})
+                    self._flat(symbol, reason=f"timeout_{timeout_min}min", ts=ts)
+                    return out
 
             # Management helpers
             self._maybe_activate_be(symbol, s, ts)
@@ -1345,6 +1397,24 @@ class StrategyV13(StrategyBase):
                 self._flat(symbol, reason="exit_ha_5m", ts=ts)
                 return out
 
+            # Timeout exit (after HA override)
+            tier = self._last_entry_tier.get(symbol, "B")
+            timeout_min = self._timeout_minutes_for_tier(tier)
+            ha_cfg = getattr(self, "cfg_d", {}).get("ha_exit", {})
+            override_timeout = ha_cfg.get("override_timeout", ha_cfg.get("HA_OVERRIDES_TIMEOUT", False))
+            moved = (float(s["entry"]) - low) / float(s["entry"]) if s["entry"] else 0.0
+            tp_pct = getattr(self, "tp_pct", 0.0)
+            tp_ok = moved >= tp_pct if tp_pct > 0 else False
+            ha5m_bar = getattr(self, "ha5m", None)
+            ha_favors_short = False
+            if ha5m_bar and hasattr(ha5m_bar, "prev_ha_open") and ha5m_bar.prev_ha_open is not None:
+                ha_favors_short = ha5m_bar.prev_ha_close < ha5m_bar.prev_ha_open
+            if timeout_min > 0 and self._elapsed_minutes(s, ts) >= timeout_min:
+                if not (override_timeout and tp_ok and ha_favors_short):
+                    out.append({"action": "COVER", "symbol": symbol, "qty": "ALL", "type": "MKT",
+                                "ts": ts, "reason": f"timeout_{timeout_min}min"})
+                    self._flat(symbol, reason=f"timeout_{timeout_min}min", ts=ts)
+                    return out
 
             # Management helpers
             self._maybe_activate_be(symbol, s, ts)
@@ -1430,11 +1500,6 @@ class StrategyV13(StrategyBase):
                 return out
 
             return None
-
-    ##
-
-
-    # --- helpers --------------------------------------------------------------
 
     def _profit_pct(self, s: dict, price: float) -> float:
         """

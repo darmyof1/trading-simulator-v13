@@ -22,7 +22,7 @@
       "max_chase_pct": 0.20
     }
   },
-  "entry_window": { "start": "09:30", "end": "13:15" },
+  "entry_window": { "start": "09:30", "end": "10:00" },
   "timezone": "US/Eastern",
   "trace_every_n": 5,
   "SIZE_MODE": "auto",
@@ -38,6 +38,14 @@
   "exits": {
     "enable_ha_5m": true
   },
+  "ha_exit": {
+    "enable": true,
+    "timeframe": "5m",
+    "require_profit": true,
+    "min_profit_pct": 0.10,
+    "override_timeout": true
+  },
+
   "results_dump_path": "logs/results",
   "results_run_label": "risk",
   "debug_signals": true,
@@ -55,26 +63,24 @@
   "allow_shorts": true,
 
   "be": { "min_minutes": 2 },
+  "be_after_partials": 2,
   "ratchet": {
     "enable": true,
     "levels": [
-      { "trigger_move_pct": 0.05, "cushion_pct": 0.0417 },
-      { "trigger_move_pct": 0.10, "cushion_pct": 0.0870 }
+      {"trigger_move_pct": 0.04, "cushion_pct": 0.002}
     ]
   },
 
-  "ha_exit": { "enable": true, "timeframe_min": 5, "min_profit_pct": 0.0, "require_profit": true },
-
   "partial_levels": [
-    { "move_pct": 0.02, "exit_fraction": 0.02 },
-    { "move_pct": 0.05, "exit_fraction": 0.10 },
-    { "move_pct": 0.10, "exit_fraction": 0.10 }
+    {"move_pct": 0.02, "exit_fraction": 0.02},
+    {"move_pct": 0.05, "exit_fraction": 0.10},
+    {"move_pct": 0.10, "exit_fraction": 0.10}
   ],
   "partial_one_per_bar": true,
-  "be_after_partials": 2,
 
   "max_trades_per_dir": 1,
   "allow_reentry_after_be": true,
 
-  "warmup_secs": 12000
+  "warmup_secs": 12000,
+  "atr_entry": { "enable": true, "include_premarket": true, "period": 14, "thresh_pct": 0.003 }
 }

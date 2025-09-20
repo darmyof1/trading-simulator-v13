@@ -106,7 +106,10 @@ git commit -m "Project now has strategy and backtest starting to work"
 
 git checkout -b fix/v13-intrabar-stops-partials-vwap-logging
 
-
+git apply -3
+git add .
+git commit
+git push
 #################################################
 # kill all python scripts
 #################################################
@@ -251,3 +254,24 @@ PY
 #################################################
 
 zip -r "TradingSimulator.zip" "Trading Simulator" -x "*/.*" -x "__MACOSX/*"
+
+# 0) See what changed
+git status
+
+# 1) Stage changes (pick one)
+git add file1 file2              # stage specific files
+git add -p                       # interactively choose hunks
+git add .                        # stage everything changed
+
+# 2) Commit with a message
+git commit -m "Short, clear message"
+
+# 3) Push to GitHub
+git push                         # if branch already tracks origin
+# (first push of a new branch:)
+git push -u origin <your-branch>
+
+
+git add .
+git commit -m "parity"
+git push

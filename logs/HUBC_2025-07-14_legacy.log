@@ -1,0 +1,12 @@
+[StrategyV13] start date=2025-07-14 symbols=['HUBC']
+[SIG] SELL_SHORT | sym=HUBC | ts=2025-07-14T13:39:00+00:00 | close=2.9400 | ema9=3.0319 | ema20=3.0328 | macd=0.0233 | sig=0.0519 | vwap=3.0783 | atr=0.1176 | entry=2.9400 | stop=3.1752 | R=0.2352 | size=4
+[PARTIAL DEBUG] lvl=1 mv=0.0050 orig=4 sold_so_far=0 desired_cum=1 to_sell=1
+[SIG] PARTIAL | sym=HUBC | ts=2025-07-14T13:42:00+00:00 | close=2.9000 | ema9=2.9880 | ema20=3.0102 | macd=-0.0001 | sig=0.0304 | vwap=3.0734 | atr=0.1032 | level=1 | exit_frac=0.25 | qty=1 | rem=3
+[PARTIAL DEBUG] lvl=2 mv=0.0100 orig=4 sold_so_far=1 desired_cum=2 to_sell=1
+[SIG] PARTIAL | sym=HUBC | ts=2025-07-14T13:43:00+00:00 | close=2.8000 | ema9=2.9504 | ema20=2.9901 | macd=-0.0162 | sig=0.0210 | vwap=3.0664 | atr=0.1072 | level=2 | exit_frac=0.25 | qty=1 | rem=2
+[PARTIAL DEBUG] lvl=3 mv=0.0200 orig=4 sold_so_far=2 desired_cum=4 to_sell=2
+[SIG] PARTIAL | sym=HUBC | ts=2025-07-14T13:44:00+00:00 | close=2.8300 | ema9=2.9263 | ema20=2.9749 | macd=-0.0263 | sig=0.0116 | vwap=3.0656 | atr=0.1017 | level=3 | exit_frac=0.5 | qty=2 | rem=0
+[SIG] BUY | sym=HUBC | ts=2025-07-14T12:56:00+00:00 | close=3.2000 | ema9=2.8003 | ema20=2.7692 | macd=0.0115 | sig=-0.0242 | vwap=2.9912 | atr=0.0643 | entry=3.2000 | stop=3.0713 | R=0.1287 | size=4
+[SIG] EXIT_STOP | sym=HUBC | ts=2025-07-14T12:57:00+00:00 | close=2.8600 | ema9=2.8123 | ema20=2.7778 | macd=0.0169 | sig=-0.0160 | vwap=2.9904 | atr=0.0883 | stop=3.0713 | low=2.8000
+[StrategyV13] end
+[RESULTS] dumped to logs/results/StrategyV13_2025-07-14_HUBC_legacy.json

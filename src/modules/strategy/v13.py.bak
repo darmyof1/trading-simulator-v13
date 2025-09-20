@@ -169,7 +169,7 @@ def parse_sig_loglines_to_trades(log_lines):
         if not line.startswith("[SIG]"):
             return None, {}
         head, *rest = line.split(" | ")
-        parts = head.split(" ")  # "[SIG] BUY" -> ["[SIG]","BUY"]
+        parts = head.split()  # "[SIG] BUY" -> ["[SIG]","BUY"]
         sig_type = parts[1] if len(parts) > 1 else None
         kv = {}
         for tok in rest:
@@ -219,27 +219,8 @@ def parse_sig_loglines_to_trades(log_lines):
         rps = t["rps"] if t["rps"] and t["rps"] > 0 else 1e-9
         r_mult = pnl / (rps * max(t["size"], 1))
         exit_causes = []
-        normalized_cause = cause
         if cause:
-            if cause == "all_partials_exit":
-                normalized_cause = "EXIT_ALL_PARTIALS"
-            elif cause.startswith("EXIT_"):
-                normalized_cause = cause
-            else:
-                normalized_cause = f"EXIT_{cause}"
-            exit_causes = [normalized_cause]
-        # Set exit_price to last partial fill if remaining==0
-        exit_price = fill_price
-        if t["remaining"] == 0 and t["partials"]:
-            exit_price = t["partials"][-1][1]
-            normalized_cause = "EXIT_ALL_PARTIALS"
-            exit_causes = [normalized_cause]
-        # Set exit_price to last partial fill if remaining==0
-        exit_price = fill_price
-        if t["remaining"] == 0 and t["partials"]:
-            exit_price = t["partials"][-1][1]
-            normalized_cause = "EXIT_ALL_PARTIALS"
-            exit_causes = [normalized_cause]
+            exit_causes = [cause if cause.startswith("EXIT_") else f"EXIT_{cause}"]
 
         closed.append({
             "symbol": t["symbol"],
@@ -250,9 +231,6 @@ def parse_sig_loglines_to_trades(log_lines):
             "PnL_$": safe_round(pnl),
             "PnL_R": safe_round(r_mult),
             "exit_causes": exit_causes,
-            "entry_price": t["entry"],
-            "exit_price": exit_price,
-            "exit_cause": normalized_cause,
         })
         open_trades.pop(sym, None)
 
@@ -308,12 +286,7 @@ def parse_sig_loglines_to_trades(log_lines):
                 # Increment partials_done counter
                 t["partials_done"] = t.get("partials_done", 0) + 1
                 if t["remaining"] == 0:
-                    # If there are partials, use the last partial's fill price
-                    if t["partials"]:
-                        fill_price = t["partials"][-1][1]
-                        close_trade(sym, cause="all_partials_exit", fill_price=fill_price)
-                    else:
-                        close_trade(sym, cause=None, fill_price=t["entry"])
+                    close_trade(sym, cause=None, fill_price=t["entry"])
 
         elif sig_type.startswith("EXIT_"):
             sym = kv.get("sym")
@@ -334,11 +307,6 @@ def parse_sig_loglines_to_trades(log_lines):
             else:
                 fill_price = open_trades[sym]["entry"]
 
-            # Add mapping for EXIT_ALL_PARTIALS
-            kind = sig_type
-            if kind == "EXIT_ALL_PARTIALS":
-                kv["exit_cause"] = "ALL_PARTIALS"
-
             close_trade(sym, cause=sig_type, fill_price=fill_price)
 
     for sym, t in list(open_trades.items()):
@@ -352,60 +320,37 @@ Bar = Dict[str, Any]
 class StrategyV13(StrategyBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._last_entry_tier: Dict[str, str] = {}          # symbol -> 'A' or 'B'
+        self._last_entry_tier: Dict[str, int] = {}          # symbol -> int tier
         self._last_entry_time = {}
         self._entry_price_by_symbol = {}
         cfg = getattr(self, "config", {}) or {}
-        raw = getattr(self, "cfg_d", {}).get("fixed_sl_pct_by_tier", {}) or {}
-        self.fixed_sl_pct_by_tier: Dict[str, float] = {str(k).upper(): float(v) for k, v in raw.items()}
-        self.fixed_sl_pct_global = float(getattr(self, "cfg_d", {}).get("fixed_sl_pct", 0.10))
+        raw = cfg.get("fixed_sl_pct_by_tier", {})
+        self.fixed_sl_pct_by_tier: Dict[int, float] = {int(k): float(v) for k, v in raw.items()}
 
+    def get_sl_pct_for_tier(self, tier: int) -> float:
+        tier_id = self._as_tier_id(tier)
+        if self.fixed_sl_pct_by_tier:
+            return self.fixed_sl_pct_by_tier.get(tier_id, self.fixed_sl_pct_by_tier.get(-1, 0.0))
+        return float(getattr(self, "fixed_sl_pct", 0.10))
 
-    def get_sl_pct_for_tier(self, tier) -> float:
-        tid = self._as_tier_id(tier) or "A"
-        if isinstance(self.fixed_sl_pct_by_tier, dict) and tid in self.fixed_sl_pct_by_tier:
-            return float(self.fixed_sl_pct_by_tier[tid])
-        if isinstance(self.fixed_sl_pct_by_tier, dict) and "*" in self.fixed_sl_pct_by_tier:
-            return float(self.fixed_sl_pct_by_tier["*"])
-        return float(getattr(self, "fixed_sl_pct_global", getattr(self, "fixed_sl_pct", 0.10)))
-
-    def _as_tier_id(self, tier) -> str | None:
-        """
-        Normalize to 'A' or 'B'. Accepts 'A'/'B', 1/2, or dicts like {'tier': 'A'}.
-        """
-        if tier is None:
-            return None
+    def _as_tier_id(self, tier) -> Optional[int]:
         if isinstance(tier, dict):
-            tier = tier.get("tier") or tier.get("id")
-
-        t = str(tier).strip().upper()
-        if t in ("A", "B"):
-            return t
-        try:
-            n = int(float(t))
-            if n == 1: return "A"
-            if n == 2: return "B"
-            return None
-        except Exception:
-            return None
-
+            return int(tier.get("tier") or tier.get("id"))
+        return int(tier) if tier is not None else None
 
     def _ensure_state(self):
         if not isinstance(self._last_entry_tier, dict):
             self._last_entry_tier = {}
 
-    def _compute_position_size(self, symbol: str, entry: float, stop: float, direction: int) -> float:
+    def _compute_position_size(self, entry: float, stop: float, direction: int) -> float:
         """
         Return number of shares to buy/sell for this entry price, matching the old v13 behavior:
         - Fractional sizing by tier (A: highProbSize, B: lateTrendSize)
         - Dynamic cash if enabled, else EQUITY
         - Min notional guard
-        NOTE: Uses per-symbol tier from self._last_entry_tier if available.
+        NOTE: We keep it independent of symbol; tier is read from a class attribute if available.
         """
         cfg = getattr(self, "cfg_d", {}) or {}
-        tier = None
-        if isinstance(getattr(self, "_last_entry_tier", None), dict):
-            tier = self._last_entry_tier.get(symbol)
 
         # --- sizing params (fall back to old-script defaults) ---
         size_mode      = cfg.get("SIZE_MODE", cfg.get("size_mode", "auto"))
@@ -415,6 +360,12 @@ class StrategyV13(StrategyBase):
         use_dyn_cash   = bool(cfg.get("USE_DYNAMIC_CASH", True))
         equity         = float(cfg.get("EQUITY", 200_000.0))
         min_notional   = float(cfg.get("MIN_TRADE_AMOUNT", 1_000.0))
+
+        # Try to detect the current entry tier that the signal logic computed.
+        # If the strategy sets one of these during signal evaluation, we’ll use it.
+        tier = getattr(self, "_last_entry_tier", None)
+        if tier is None:
+            tier = getattr(self, "_last_tier", None)
 
         # --- choose fraction by mode/tier (old v13 rules) ---
         if size_mode == "auto":
@@ -431,6 +382,7 @@ class StrategyV13(StrategyBase):
         # --- capital base ---
         base_cap = None
         if use_dyn_cash:
+            # prefer a runtime cash field if the runner sets one
             for attr in ("available_cash", "cash", "current_balance"):
                 val = getattr(self, attr, None)
                 if isinstance(val, (int, float)):
@@ -448,11 +400,14 @@ class StrategyV13(StrategyBase):
 
         # Min-notional guard (only meaningful with dynamic cash)
         if use_dyn_cash and trade_amount < min_notional:
+            # 0 shares → caller will treat as "skip entry" or simply not place an order
             return 0.0
 
         if entry is None or entry <= 0:
+            # Defensive: if no valid price, do not size
             return 0.0
 
+        # Old script allowed fractional shares in the sim; keep that behavior.
         shares = trade_amount / float(entry)
         return float(shares)
     # --- time helpers ---
@@ -497,25 +452,6 @@ class StrategyV13(StrategyBase):
                             "ts": ts, "reason": "exit_ha_5m"})
                 self._flat(symbol, reason="exit_ha_5m", ts=ts)
                 return out
-
-            # Timeout exit (after HA override)
-            tier = self._last_entry_tier.get(symbol, "B")
-            timeout_min = self._timeout_minutes_for_tier(tier)
-            ha_cfg = getattr(self, "cfg_d", {}).get("ha_exit", {})
-            override_timeout = ha_cfg.get("override_timeout", ha_cfg.get("HA_OVERRIDES_TIMEOUT", False))
-            moved = (float(s["entry"]) - low) / float(s["entry"]) if s["entry"] else 0.0
-            tp_pct = getattr(self, "tp_pct", 0.0)
-            tp_ok = moved >= tp_pct if tp_pct > 0 else False
-            ha5m_bar = getattr(self, "ha5m", None)
-            ha_favors_short = False
-            if ha5m_bar and hasattr(ha5m_bar, "prev_ha_open") and ha5m_bar.prev_ha_open is not None:
-                ha_favors_short = ha5m_bar.prev_ha_close < ha5m_bar.prev_ha_open
-            if timeout_min > 0 and self._elapsed_minutes(s, ts) >= timeout_min:
-                if not (override_timeout and tp_ok and ha_favors_short):
-                    out.append({"action": "COVER", "symbol": symbol, "qty": "ALL", "type": "MKT",
-                                "ts": ts, "reason": f"timeout_{timeout_min}min"})
-                    self._flat(symbol, reason=f"timeout_{timeout_min}min", ts=ts)
-                    return out
 
             # Management helpers
             # --- Safer BE/trailing logic for SHORT ---
@@ -638,29 +574,7 @@ class StrategyV13(StrategyBase):
             self._log(f"[INFO] BE Activated | sym={symbol} | ts={pd.Timestamp(ts).isoformat()} | after_partials={partials_taken} | minutes={minutes_in_pos:.1f}")
 
     # --- Step-ratchet (entry-anchored) ---
-    def _apply_ratchet(self, side: str, price: float, prev_stop: float, entry: float,
-                       trigger_move_pct: float, cushion_pct: float, sym=None, ts=None):
-        """
-        Move stop only in your favor.
-          LONG:  stop = max(prev_stop, price * (1 - cushion_pct))
-          SHORT: stop = min(prev_stop, price * (1 + cushion_pct))
-        """
-        cushion_abs = price * cushion_pct
-        if side.upper() == "LONG":
-            target = price - cushion_abs
-            new_stop = max(prev_stop, target)
-        else:  # SHORT
-            target = price + cushion_abs
-            new_stop = min(prev_stop, target)
-        if new_stop != prev_stop:
-            self._dbg(sym or "?", {"timestamp": ts or "?", "close": price},
-                      tag="STOP_UPDATE",
-                      extra={"from": f"{prev_stop:.4f}", "to": f"{new_stop:.4f}",
-                             "reason": f"ratchet_{trigger_move_pct*100:.1f}%",
-                             "cushion_pct": f"{cushion_pct*100:.2f}%"})
-        return new_stop
-
-    def _apply_ratchet_old(self, symbol: str, s: dict, price: float, ts) -> None:
+    def _apply_ratchet(self, symbol: str, s: dict, price: float, ts) -> None:
         rcfg = getattr(self.cfg, "ratchet", {}) or {}
         if not rcfg.get("enable", False):
             return
@@ -863,11 +777,6 @@ class StrategyV13(StrategyBase):
             trade["remaining_shares"] = remaining
             trade["size"]             = remaining
             if remaining <= 0:
-                # Emit a terminal exit event so the parser knows this trade ended via partials
-                if remaining <= 1e-9:
-                    self._dbg(trade.get("symbol", "?"),
-                              f"EXIT_ALL_PARTIALS | rem=0 | reason=ALL_PARTIALS | last_fill={fill_px}",
-                              ts=ts, fill=fill_px)
                 break
 
     def _compat_config(self, cfg):
@@ -934,37 +843,17 @@ class StrategyV13(StrategyBase):
         self.lot_size = int(cfg.get("lot_size", 1))
         self.base_size = float(cfg.get("base_size", 4))
 
-    def _as_tier_id(self, tier) -> str | None:
-        """
-        Normalize to 'A' or 'B'. Accepts 'A'/'B', 1/2, or dicts like {'tier': 'A'}.
-        """
-        if tier is None:
-            return None
+    def _as_tier_id(self, tier):
+        # Accept int/str or dict payloads
         if isinstance(tier, dict):
-            tier = tier.get("tier") or tier.get("id")
+            return int(tier.get("tier") or tier.get("id"))
+        return int(tier) if tier is not None else None
 
-        t = str(tier).strip().upper()
-        if t in ("A", "B"):
-            return t
-        try:
-            n = int(float(t))
-            if n == 1:
-                return "A"
-            if n == 2:
-                return "B"
-            return None
-        except Exception:
-            return None
-
-
-    def get_sl_pct_for_tier(self, tier) -> float:
-        tid = self._as_tier_id(tier) or "A"
-        if isinstance(self.fixed_sl_pct_by_tier, dict) and tid in self.fixed_sl_pct_by_tier:
-            return float(self.fixed_sl_pct_by_tier[tid])
-        if isinstance(self.fixed_sl_pct_by_tier, dict) and "*" in self.fixed_sl_pct_by_tier:
-            return float(self.fixed_sl_pct_by_tier["*"])
-        return float(getattr(self, "fixed_sl_pct_global", getattr(self, "fixed_sl_pct", 0.10)))
-
+    def get_sl_pct_for_tier(self, tier):
+        tier_id = self._as_tier_id(tier)
+        if self.fixed_sl_pct_by_tier:
+            return self.fixed_sl_pct_by_tier.get(tier_id, self.fixed_sl_pct_by_tier.get(-1, 0.0))
+        return float(getattr(self, "fixed_sl_pct", 0.10))
 
     def on_start(self, ctx=None, *args, date=None, symbols=None, **kwargs):
         """
@@ -1061,10 +950,8 @@ class StrategyV13(StrategyBase):
         self.fixed_sl_pct_global = float(self.cfg_d.get("fixed_sl_pct", 0.10))
         _fsp_map = self.cfg_d.get("fixed_sl_pct_by_tier", {})
         self.fixed_sl_pct_by_tier = {str(k).upper(): float(v) for k, v in _fsp_map.items()} if _fsp_map else {}
-        assert all(k in ("A", "B", "*") for k in self.fixed_sl_pct_by_tier.keys()), \
-            f"fixed_sl_pct_by_tier must be string-keyed A/B/*, got: {self.fixed_sl_pct_by_tier.keys()}"
         # one-time helpers/containers
-        self.ha5m = {symbol: HA5m() for symbol in self.symbols}
+        self.ha5m = HA5m()
         self.buffers = {}
         self.state = {}
 
@@ -1092,19 +979,14 @@ class StrategyV13(StrategyBase):
 
         # track EMA cross timing & last-chosen tier (per symbol)
         self._ema_cross_age_bars = {}     # {sym: bars since last cross}
-        self._prev_emas = {}
-        self._last_entry_tier = {}
+        self._last_entry_tier = {}        # {sym: 'A' or 'B'}
         for sym in self.symbols:
-            self._ema_cross_age_bars[sym] = 0
-            self._last_entry_tier[sym] = 0  # unknown until we compute it
-            self._prev_emas[sym] = {'ema9': None, 'ema20': None}
-
+            self._ema_cross_age_bars[sym] = None
+            self._last_entry_tier[sym] = 1  # default to int tier 1
 
     def on_bar(self, symbol: str, bar: Bar) -> Optional[Iterable[Dict[str, Any]]]:
 
         self._ensure_state()
-        
-        
 
         # --- set current bar time for logging ---
         ts = getattr(bar, "ts", None)
@@ -1133,15 +1015,6 @@ class StrategyV13(StrategyBase):
             "close": float(bar["close"]),
             "volume": float(bar.get("volume", 0.0)),
         }
-        # Extract values to avoid naming conflicts with built-ins
-        open_val = row_dict["open"]
-        high_val = row_dict["high"]
-        low_val = row_dict["low"]
-        close_val = row_dict["close"]
-    
-        # Update HA5m for this symbol
-        ha5m_obj = self.ha5m[symbol]
-        ha_bar = ha5m_obj.update(ts, open_val, high_val, low_val, close_val)
         df.loc[len(df)] = row_dict
 
 
@@ -1254,32 +1127,33 @@ class StrategyV13(StrategyBase):
                     self._log(
                         f"[TRACE] sig | long_ok={long_ok} short_ok={short_ok} "
                         f"vwap_filter={getattr(self.cfg, 'vwap_filter', False)} "
-                        f"allow_shorts={allow_shorts}"
+                        f"allow_shorts={allow_shorts} "
+                        f"ema9={ema9:.4f} ema20={ema20:.4f} macd={macd_now:.4f} sig={sig_now:.4f} vwap={vwap_val:.4f}"
                     )
 
-                    s["entries_long"] += 1
-                    out.append({
-                        "action": "BUY", "symbol": symbol, "qty": size, "type": "MKT",
-                        "ts": ts, "entry": entry, "stop": stop,
-                        "reason": "ema9>ema20 + macd>sig" + (
-                            " + vwap" if getattr(self.cfg, "vwap_filter", False) else ""
-                        )
+                if long_ok and can_long:
+                    entry = close
+                    sl_pct = self.get_sl_pct_for_tier(tier_id)
+                    stop = entry * (1.0 - sl_pct)
+                    size = self._compute_position_size(entry=entry, stop=stop, direction=+1)
+                    s.update({
+                        "pos": +1, "entry": entry, "stop": stop, "r": max(1e-9, entry - stop),
+                        "size": size, "orig_size": size, "took_partial": 0, "be_active": False,
+                        "side": "BUY", "symbol": symbol, "best": entry
                     })
-                    self._dbg(
-                        symbol, last, tag="BUY",
-                        extra={
-                            "entry": f"{entry:.4f}", "stop": f"{stop:.4f}",
-                            "R": f"{entry - stop:.4f}", "size": size
-                        }
-                    )
+                    if s.get("allow_reentry_long"): s["allow_reentry_long"] = False
+                    else: s["entries_long"] += 1
+                    out.append({"action":"BUY", "symbol":symbol, "qty":size, "type":"MKT",
+                                "ts": ts, "entry": entry, "stop": stop,
+                                "reason":"ema9>ema20 + macd>sig" + (" + vwap" if getattr(self.cfg, "vwap_filter", False) else "")})
+                    self._dbg(symbol, last, tag="BUY", extra={"entry": f"{entry:.4f}", "stop": f"{stop:.4f}", "R": f"{entry-stop:.4f}", "size": size})
                     return out
 
                 if short_ok and can_short:
-                    entry = fill_price
-                    # self._last_entry_tier[symbol] = "B"  # redundant, already set by auto-tier
-                    sl_pct = self.get_sl_pct_for_tier("B")
+                    entry = close
+                    sl_pct = self.get_sl_pct_for_tier(tier_id)
                     stop = entry * (1.0 + sl_pct)
-                    size = self._compute_position_size(symbol=symbol, entry=entry, stop=stop, direction=-1)
+                    size = self._compute_position_size(entry=entry, stop=stop, direction=-1)
                     s.update({
                         "pos": -1, "entry": entry, "stop": stop, "r": max(1e-9, stop - entry),
                         "size": size, "orig_size": size, "took_partial": 0, "be_active": False,
@@ -1303,35 +1177,6 @@ class StrategyV13(StrategyBase):
                 self._flat(symbol, reason="exit_ha_5m", ts=ts)
                 return out
 
-            # Timeout exit (after HA override)
-            tier = self._last_entry_tier.get(symbol, "A")
-            timeout_min = self._timeout_minutes_for_tier(tier)
-            ha_cfg = getattr(self, "cfg_d", {}).get("ha_exit", {})
-            override_timeout = ha_cfg.get("override_timeout", ha_cfg.get("HA_OVERRIDES_TIMEOUT", False))
-            moved = (high - float(s["entry"])) / float(s["entry"]) if s["entry"] else 0.0
-            tp_pct = getattr(self, "tp_pct", 0.0)
-            tp_ok = moved >= tp_pct if tp_pct > 0 else False
-            # Get last closed 5m HA bar
-            ha5m_bar = getattr(self, "ha5m", None)
-            ha_favors_long = False
-            if ha5m_bar and hasattr(ha5m_bar, "prev_ha_open") and ha5m_bar.prev_ha_open is not None:
-                ha_favors_long = ha5m_bar.prev_ha_close > ha5m_bar.prev_ha_open
-            if timeout_min > 0 and self._elapsed_minutes(s, ts) >= timeout_min:
-                # --- HA vs Timeout precedence (parity with old) ---
-                ha_cfg = getattr(self, "cfg_d", {}).get("ha_exit", {})
-                override_timeout = ha_cfg.get("override_timeout", ha_cfg.get("HA_OVERRIDES_TIMEOUT", False))
-                moved = (high - float(s["entry"])) / float(s["entry"]) if s["entry"] else 0.0
-                tp_pct = getattr(self, "tp_pct", 0.0)
-                tp_ok = moved >= tp_pct if tp_pct > 0 else False
-                ha5m_bar = getattr(self, "ha5m", None)
-                ha_favors_long = False
-                if ha5m_bar and hasattr(ha5m_bar, "prev_ha_open") and ha5m_bar.prev_ha_open is not None:
-                    ha_favors_long = ha5m_bar.prev_ha_close > ha5m_bar.prev_ha_open
-                if not (override_timeout and tp_ok and ha_favors_long):
-                    out.append({"action": "SELL", "symbol": symbol, "qty": "ALL", "type": "MKT",
-                                "ts": ts, "reason": f"timeout_{timeout_min}min"})
-                    self._flat(symbol, reason=f"timeout_{timeout_min}min", ts=ts)
-                    return out
 
             # Management helpers
             self._maybe_activate_be(symbol, s, ts)
@@ -1341,7 +1186,7 @@ class StrategyV13(StrategyBase):
 
             # 1) hard stop
             if low <= stop:
-                be_exit = s.get("be_active", False) and abs(s["stop"] - entry) <= max(1e-6, 1e-6 * entry)
+                be_exit = s.get("be_active", False) and abs(stop - entry) <= max(1e-6, 1e-6 * entry)
                 self._flat(symbol, reason="stop_hit", ts=ts)
                 out.append({"action":"SELL", "symbol":symbol, "qty":"ALL", "type":"MKT",
                             "ts": ts, "reason":"stop_hit", "stop": stop})
@@ -1410,7 +1255,7 @@ class StrategyV13(StrategyBase):
                 s["be_active"] = True
 
             # 5) bias exit (cross down)
-            bearish_cross = (p_ema9 >= p_ema20) and (ema9 < p_ema20)
+            bearish_cross = (p_ema9 >= p_ema20) and (ema9 < ema20)
             if bearish_cross and getattr(self.cfg, "bias_exit_on_cross", False):
                 self._flat(symbol, reason="bias_exit", ts=ts)
                 out.append({"action":"SELL", "symbol":symbol, "qty":"ALL", "type":"MKT", "ts": ts, "reason":"bias_exit"})
@@ -1430,34 +1275,6 @@ class StrategyV13(StrategyBase):
                 self._flat(symbol, reason="exit_ha_5m", ts=ts)
                 return out
 
-            # Timeout exit (after HA override)
-            tier = self._last_entry_tier.get(symbol, "B")
-            timeout_min = self._timeout_minutes_for_tier(tier)
-            ha_cfg = getattr(self, "cfg_d", {}).get("ha_exit", {})
-            override_timeout = ha_cfg.get("override_timeout", ha_cfg.get("HA_OVERRIDES_TIMEOUT", False))
-            moved = (float(s["entry"]) - low) / float(s["entry"]) if s["entry"] else 0.0
-            tp_pct = getattr(self, "tp_pct", 0.0)
-            tp_ok = moved >= tp_pct if tp_pct > 0 else False
-            ha5m_bar = getattr(self, "ha5m", None)
-            ha_favors_short = False
-            if ha5m_bar and hasattr(ha5m_bar, "prev_ha_open") and ha5m_bar.prev_ha_open is not None:
-                ha_favors_short = ha5m_bar.prev_ha_close < ha5m_bar.prev_ha_open
-            if timeout_min > 0 and self._elapsed_minutes(s, ts) >= timeout_min:
-                # --- HA vs Timeout precedence (parity with old) ---
-                ha_cfg = getattr(self, "cfg_d", {}).get("ha_exit", {})
-                override_timeout = ha_cfg.get("override_timeout", ha_cfg.get("HA_OVERRIDES_TIMEOUT", False))
-                moved = (float(s["entry"]) - low) / float(s["entry"]) if s["entry"] else 0.0
-                tp_pct = getattr(self, "tp_pct", 0.0)
-                tp_ok = moved >= tp_pct if tp_pct > 0 else False
-                ha5m_bar = getattr(self, "ha5m", None)
-                ha_favors_short = False
-                if ha5m_bar and hasattr(ha5m_bar, "prev_ha_open") and ha5m_bar.prev_ha_open is not None:
-                    ha_favors_short = ha5m_bar.prev_ha_close < ha5m_bar.prev_ha_open
-                if not (override_timeout and tp_ok and ha_favors_short):
-                    out.append({"action": "COVER", "symbol": symbol, "qty": "ALL", "type": "MKT",
-                                "ts": ts, "reason": f"timeout_{timeout_min}min"})
-                    self._flat(symbol, reason=f"timeout_{timeout_min}min", ts=ts)
-                    return out
 
             # Management helpers
             self._maybe_activate_be(symbol, s, ts)
@@ -1543,6 +1360,11 @@ class StrategyV13(StrategyBase):
                 return out
 
             return None
+
+    ##
+
+
+    # --- helpers --------------------------------------------------------------
 
     def _profit_pct(self, s: dict, price: float) -> float:
         """
@@ -1638,13 +1460,12 @@ class StrategyV13(StrategyBase):
             if target < float(s["stop"]):
                 s["stop"] = self._set_stop("SHORT", s.get("symbol", ""), ts, px, target, entry, s["stop"], reason=f"ratchet_{rpct}%")
 
-    def _initial_stop(self, entry: float, atrv: float, *, direction: int) -> Tuple[float, Optional[float]]:
+    def _initial_stop(self, entry: float, atrv: float, *, direction: int) -> float:
         stop_mode = getattr(self.cfg, "stop_mode", "fixed")
         cfg = getattr(self, "cfg_d", {}) or {}
         if stop_mode == "fixed":
             pct = cfg.get("fixed_sl_pct", 0.10)
             tier = getattr(self, "_last_entry_tier", None) or getattr(self, "_last_tier", None)
-
             if tier and tier in getattr(self, "fixed_sl_by_tier", {}):
                 pct = float(self.fixed_sl_by_tier[tier])
 
@@ -1672,8 +1493,10 @@ class StrategyV13(StrategyBase):
 
     def _flat(self, symbol: str, *, reason: str, ts: pd.Timestamp) -> None:
         self.state[symbol].update({
+           
             "pos": 0, "entry": None, "stop": None, "r": None, "size": 0,
             "took_partial": 0, "be_active": False
+
         })
 
     def on_end(self, *_, **__):
@@ -1698,7 +1521,7 @@ class StrategyV13(StrategyBase):
         syms = list(getattr(self, "symbols", []) or [])
         sym_label = syms[0] if len(syms) == 1 else "_MULTI"
         run_label = getattr(self, "results_run_label", "risk")
-        dump_dir = getattr(self, "results_dump_path", None) or "./logs/results"
+        dump_dir = getattr(self, "results_dump_path", "./logs/results")
         os.makedirs(dump_dir, exist_ok=True)
         fname = f"StrategyV13_{date}_{sym_label}_{run_label}.json"
 
@@ -1773,42 +1596,24 @@ class StrategyV13(StrategyBase):
         Track bars since last EMA9/EMA20 cross.
         Reset to 0 when a cross occurs; otherwise increment.
         """
-        # Initialize if not exists
-        if sym not in self._ema_cross_age_bars:
-            self._ema_cross_age_bars[sym] = 0
-        
-        # Initialize previous EMA storage if not exists
-        if not hasattr(self, '_prev_emas'):
-            self._prev_emas = {}
-        if sym not in self._prev_emas:
-            self._prev_emas[sym] = {'ema9': None, 'ema20': None}
-        
-        # Get previous values
-        prev_ema9, prev_ema20 = self._prev_emas[sym]['ema9'], self._prev_emas[sym]['ema20']
-        
-        # Check if we have enough data to detect a cross
-        if (ema9 is not None and ema20 is not None and 
-            prev_ema9 is not None and prev_ema20 is not None):
-            
-            # Detect cross: previous values were on opposite sides compared to current values
-            prev_above = prev_ema9 > prev_ema20
-            curr_above = ema9 > ema20
-            
-            if prev_above != curr_above:
-                # Cross detected - reset counter
+        age = self._ema_cross_age_bars.get(sym)
+        crossed = None
+        if ema9 is not None and ema20 is not None:
+            # detect fresh cross
+            prev_age = age
+            # If prev_age is None, initialize
+            if prev_age is None:
                 self._ema_cross_age_bars[sym] = 0
-            else:
-                # No cross - increment counter
-                self._ema_cross_age_bars[sym] += 1
+                return
+
+            # We need the previous bar's EMAs to detect a flip; if you keep them, use them.
+            # If not, approximate: when the sign of (ema9-ema20) changes vs last bar's sign.
+            # Minimal: if trend direction appears to have flipped this bar, reset to 0.
+            # (If you already maintain prior EMAs, replace this logic with that.)
+            # Fall back: just increment; cross detection depends on your existing signal code.
+            self._ema_cross_age_bars[sym] = prev_age + 1
         else:
-            # Not enough data yet, just increment or maintain current value
-            if self._ema_cross_age_bars[sym] is not None:
-                self._ema_cross_age_bars[sym] += 1
-            else:
-                self._ema_cross_age_bars[sym] = 0
-        
-        # Store current values for next comparison
-        self._prev_emas[sym] = {'ema9': ema9, 'ema20': ema20}
+            self._ema_cross_age_bars[sym] = age if age is not None else 0
 
     def _tier_for_context(self, sym, bar, ema9, ema20, vwap, macd, sig):
         """
@@ -1845,7 +1650,7 @@ class StrategyV13(StrategyBase):
         dist_to_vwap = 0.0 if vwap == 0 else abs(px - vwap) / vwap
 
         # Heuristic: if we are late (age >= min), and we’re within a reasonable pullback
-        # region (not chasing too far past VWAP), allow Tier B. Otherwise Tier A.
+        # region (not chasing too far), allow Tier B. Otherwise Tier A.
         if age >= min_age and dist_to_vwap <= max_chase_pct:
             chosen = 'B'
 

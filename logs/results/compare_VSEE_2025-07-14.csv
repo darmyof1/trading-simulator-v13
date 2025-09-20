@@ -1,0 +1,3 @@
+run_file,symbol,side,size,partials_qtys,cum_of_original_ok,PnL_$,PnL_R,exit_causes
+StrategyV13_2025-07-14_VSEE,VSEE,SELL_SHORT,6410,"[128, 641]",True,392.94,0.39,['EXIT_STOP']
+StrategyV13_2025-07-14_VSEE_risk,VSEE,SELL_SHORT,6410,"[128, 641]",True,392.94,0.39,['EXIT_STOP']

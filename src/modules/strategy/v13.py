@@ -228,7 +228,12 @@ def parse_sig_loglines_to_trades(log_lines):
             else:
                 normalized_cause = f"EXIT_{cause}"
             exit_causes = [normalized_cause]
-
+        # Set exit_price to last partial fill if remaining==0
+        exit_price = fill_price
+        if t["remaining"] == 0 and t["partials"]:
+            exit_price = t["partials"][-1][1]
+            normalized_cause = "EXIT_ALL_PARTIALS"
+            exit_causes = [normalized_cause]
         # Set exit_price to last partial fill if remaining==0
         exit_price = fill_price
         if t["remaining"] == 0 and t["partials"]:
@@ -303,7 +308,12 @@ def parse_sig_loglines_to_trades(log_lines):
                 # Increment partials_done counter
                 t["partials_done"] = t.get("partials_done", 0) + 1
                 if t["remaining"] == 0:
-                    close_trade(sym, cause=None, fill_price=t["entry"])
+                    # If there are partials, use the last partial's fill price
+                    if t["partials"]:
+                        fill_price = t["partials"][-1][1]
+                        close_trade(sym, cause="all_partials_exit", fill_price=fill_price)
+                    else:
+                        close_trade(sym, cause=None, fill_price=t["entry"])
 
         elif sig_type.startswith("EXIT_"):
             sym = kv.get("sym")
@@ -1054,7 +1064,7 @@ class StrategyV13(StrategyBase):
         assert all(k in ("A", "B", "*") for k in self.fixed_sl_pct_by_tier.keys()), \
             f"fixed_sl_pct_by_tier must be string-keyed A/B/*, got: {self.fixed_sl_pct_by_tier.keys()}"
         # one-time helpers/containers
-        self.ha5m = HA5m()
+        self.ha5m = {symbol: HA5m() for symbol in self.symbols}
         self.buffers = {}
         self.state = {}
 
@@ -1082,15 +1092,19 @@ class StrategyV13(StrategyBase):
 
         # track EMA cross timing & last-chosen tier (per symbol)
         self._ema_cross_age_bars = {}     # {sym: bars since last cross}
+        self._prev_emas = {}
         self._last_entry_tier = {}
         for sym in self.symbols:
-            self._ema_cross_age_bars[sym] = None
-            self._last_entry_tier[sym] = None  # unknown until we compute it
+            self._ema_cross_age_bars[sym] = 0
+            self._last_entry_tier[sym] = 0  # unknown until we compute it
+            self._prev_emas[sym] = {'ema9': None, 'ema20': None}
 
 
     def on_bar(self, symbol: str, bar: Bar) -> Optional[Iterable[Dict[str, Any]]]:
 
         self._ensure_state()
+        
+        
 
         # --- set current bar time for logging ---
         ts = getattr(bar, "ts", None)
@@ -1119,6 +1133,15 @@ class StrategyV13(StrategyBase):
             "close": float(bar["close"]),
             "volume": float(bar.get("volume", 0.0)),
         }
+        # Extract values to avoid naming conflicts with built-ins
+        open_val = row_dict["open"]
+        high_val = row_dict["high"]
+        low_val = row_dict["low"]
+        close_val = row_dict["close"]
+    
+        # Update HA5m for this symbol
+        ha5m_obj = self.ha5m[symbol]
+        ha_bar = ha5m_obj.update(ts, open_val, high_val, low_val, close_val)
         df.loc[len(df)] = row_dict
 
 
@@ -1294,6 +1317,16 @@ class StrategyV13(StrategyBase):
             if ha5m_bar and hasattr(ha5m_bar, "prev_ha_open") and ha5m_bar.prev_ha_open is not None:
                 ha_favors_long = ha5m_bar.prev_ha_close > ha5m_bar.prev_ha_open
             if timeout_min > 0 and self._elapsed_minutes(s, ts) >= timeout_min:
+                # --- HA vs Timeout precedence (parity with old) ---
+                ha_cfg = getattr(self, "cfg_d", {}).get("ha_exit", {})
+                override_timeout = ha_cfg.get("override_timeout", ha_cfg.get("HA_OVERRIDES_TIMEOUT", False))
+                moved = (high - float(s["entry"])) / float(s["entry"]) if s["entry"] else 0.0
+                tp_pct = getattr(self, "tp_pct", 0.0)
+                tp_ok = moved >= tp_pct if tp_pct > 0 else False
+                ha5m_bar = getattr(self, "ha5m", None)
+                ha_favors_long = False
+                if ha5m_bar and hasattr(ha5m_bar, "prev_ha_open") and ha5m_bar.prev_ha_open is not None:
+                    ha_favors_long = ha5m_bar.prev_ha_close > ha5m_bar.prev_ha_open
                 if not (override_timeout and tp_ok and ha_favors_long):
                     out.append({"action": "SELL", "symbol": symbol, "qty": "ALL", "type": "MKT",
                                 "ts": ts, "reason": f"timeout_{timeout_min}min"})
@@ -1410,6 +1443,16 @@ class StrategyV13(StrategyBase):
             if ha5m_bar and hasattr(ha5m_bar, "prev_ha_open") and ha5m_bar.prev_ha_open is not None:
                 ha_favors_short = ha5m_bar.prev_ha_close < ha5m_bar.prev_ha_open
             if timeout_min > 0 and self._elapsed_minutes(s, ts) >= timeout_min:
+                # --- HA vs Timeout precedence (parity with old) ---
+                ha_cfg = getattr(self, "cfg_d", {}).get("ha_exit", {})
+                override_timeout = ha_cfg.get("override_timeout", ha_cfg.get("HA_OVERRIDES_TIMEOUT", False))
+                moved = (float(s["entry"]) - low) / float(s["entry"]) if s["entry"] else 0.0
+                tp_pct = getattr(self, "tp_pct", 0.0)
+                tp_ok = moved >= tp_pct if tp_pct > 0 else False
+                ha5m_bar = getattr(self, "ha5m", None)
+                ha_favors_short = False
+                if ha5m_bar and hasattr(ha5m_bar, "prev_ha_open") and ha5m_bar.prev_ha_open is not None:
+                    ha_favors_short = ha5m_bar.prev_ha_close < ha5m_bar.prev_ha_open
                 if not (override_timeout and tp_ok and ha_favors_short):
                     out.append({"action": "COVER", "symbol": symbol, "qty": "ALL", "type": "MKT",
                                 "ts": ts, "reason": f"timeout_{timeout_min}min"})
@@ -1595,7 +1638,7 @@ class StrategyV13(StrategyBase):
             if target < float(s["stop"]):
                 s["stop"] = self._set_stop("SHORT", s.get("symbol", ""), ts, px, target, entry, s["stop"], reason=f"ratchet_{rpct}%")
 
-    def _initial_stop(self, entry: float, atrv: float, *, direction: int) -> float:
+    def _initial_stop(self, entry: float, atrv: float, *, direction: int) -> Tuple[float, Optional[float]]:
         stop_mode = getattr(self.cfg, "stop_mode", "fixed")
         cfg = getattr(self, "cfg_d", {}) or {}
         if stop_mode == "fixed":
@@ -1629,10 +1672,8 @@ class StrategyV13(StrategyBase):
 
     def _flat(self, symbol: str, *, reason: str, ts: pd.Timestamp) -> None:
         self.state[symbol].update({
-           
             "pos": 0, "entry": None, "stop": None, "r": None, "size": 0,
             "took_partial": 0, "be_active": False
-
         })
 
     def on_end(self, *_, **__):
@@ -1732,24 +1773,42 @@ class StrategyV13(StrategyBase):
         Track bars since last EMA9/EMA20 cross.
         Reset to 0 when a cross occurs; otherwise increment.
         """
-        age = self._ema_cross_age_bars.get(sym)
-        crossed = None
-        if ema9 is not None and ema20 is not None:
-            # detect fresh cross
-            prev_age = age
-            # If prev_age is None, initialize
-            if prev_age is None:
+        # Initialize if not exists
+        if sym not in self._ema_cross_age_bars:
+            self._ema_cross_age_bars[sym] = 0
+        
+        # Initialize previous EMA storage if not exists
+        if not hasattr(self, '_prev_emas'):
+            self._prev_emas = {}
+        if sym not in self._prev_emas:
+            self._prev_emas[sym] = {'ema9': None, 'ema20': None}
+        
+        # Get previous values
+        prev_ema9, prev_ema20 = self._prev_emas[sym]['ema9'], self._prev_emas[sym]['ema20']
+        
+        # Check if we have enough data to detect a cross
+        if (ema9 is not None and ema20 is not None and 
+            prev_ema9 is not None and prev_ema20 is not None):
+            
+            # Detect cross: previous values were on opposite sides compared to current values
+            prev_above = prev_ema9 > prev_ema20
+            curr_above = ema9 > ema20
+            
+            if prev_above != curr_above:
+                # Cross detected - reset counter
                 self._ema_cross_age_bars[sym] = 0
-                return
-
-            # We need the previous bar's EMAs to detect a flip; if you keep them, use them.
-            # If not, approximate: when the sign of (ema9-ema20) changes vs last bar's sign.
-            # Minimal: if trend direction appears to have flipped this bar, reset to 0.
-            # (If you already maintain prior EMAs, replace this logic with that.)
-            # Fall back: just increment; cross detection depends on your existing signal code.
-            self._ema_cross_age_bars[sym] = prev_age + 1
+            else:
+                # No cross - increment counter
+                self._ema_cross_age_bars[sym] += 1
         else:
-            self._ema_cross_age_bars[sym] = age if age is not None else 0
+            # Not enough data yet, just increment or maintain current value
+            if self._ema_cross_age_bars[sym] is not None:
+                self._ema_cross_age_bars[sym] += 1
+            else:
+                self._ema_cross_age_bars[sym] = 0
+        
+        # Store current values for next comparison
+        self._prev_emas[sym] = {'ema9': ema9, 'ema20': ema20}
 
     def _tier_for_context(self, sym, bar, ema9, ema20, vwap, macd, sig):
         """

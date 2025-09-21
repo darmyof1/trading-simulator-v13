@@ -228,12 +228,7 @@ def parse_sig_loglines_to_trades(log_lines):
             else:
                 normalized_cause = f"EXIT_{cause}"
             exit_causes = [normalized_cause]
-        # Set exit_price to last partial fill if remaining==0
-        exit_price = fill_price
-        if t["remaining"] == 0 and t["partials"]:
-            exit_price = t["partials"][-1][1]
-            normalized_cause = "EXIT_ALL_PARTIALS"
-            exit_causes = [normalized_cause]
+
         # Set exit_price to last partial fill if remaining==0
         exit_price = fill_price
         if t["remaining"] == 0 and t["partials"]:
@@ -488,135 +483,172 @@ class StrategyV13(StrategyBase):
                     return str(ts)
         return datetime.now(timezone.utc).isoformat()
 
-        if s["pos"] == -1:
-            entry = float(s["entry"]); stop = float(s["stop"])
+    # --- short position management (moved out of _now_iso) ---
+    def _manage_open_short(self, symbol: str, s: Dict[str, Any], last: Dict[str, Any], ts: str, out: List[Dict[str, Any]]):
+        close = float(last.get("close") or last.get("c") or 0.0)
+        low   = float(last.get("low")   or last.get("l") or close)
+        high  = float(last.get("high")  or last.get("h") or close)
+        atrv  = float(last.get("atr")   or last.get("atrv") or 0.0)
 
-            # HA(5m) exit precedence
-            if self._maybe_exit_ha(symbol, s, last):
+        # HA(5m) exit precedence
+        if self._maybe_exit_ha(symbol, s, last):
+            out.append({"action": "COVER", "symbol": symbol, "qty": "ALL", "type": "MKT",
+                        "ts": ts, "reason": "exit_ha_5m"})
+            self._flat(symbol, reason="exit_ha_5m", ts=ts)
+            return out
+
+        # Timeout exit (after HA override)
+        tier = self._last_entry_tier.get(symbol, "B")
+        timeout_min = self._timeout_minutes_for_tier(tier)
+        ha_cfg = getattr(self, "cfg_d", {}).get("ha_exit", {})
+        override_timeout = ha_cfg.get("override_timeout", ha_cfg.get("HA_OVERRIDES_TIMEOUT", False))
+        moved = (float(s["entry"]) - low) / float(s["entry"]) if s["entry"] else 0.0
+        tp_pct = getattr(self, "tp_pct", 0.0)
+        tp_ok = moved >= tp_pct if tp_pct > 0 else False
+        ha5m_bar = getattr(self, "ha5m", None)
+        ha_favors_short = False
+        if ha5m_bar and hasattr(ha5m_bar, "prev_ha_open") and ha5m_bar.prev_ha_open is not None:
+            ha_favors_short = ha5m_bar.prev_ha_close < ha5m_bar.prev_ha_open
+        
+        if timeout_min > 0 and self._elapsed_minutes(s, ts) >= timeout_min:
+            if not (override_timeout and tp_ok and ha_favors_short):
                 out.append({"action": "COVER", "symbol": symbol, "qty": "ALL", "type": "MKT",
-                            "ts": ts, "reason": "exit_ha_5m"})
-                self._flat(symbol, reason="exit_ha_5m", ts=ts)
+                            "ts": ts, "reason": f"timeout_{timeout_min}min"})
+                self._flat(symbol, reason=f"timeout_{timeout_min}min", ts=ts)
                 return out
 
-            # Timeout exit (after HA override)
-            tier = self._last_entry_tier.get(symbol, "B")
-            timeout_min = self._timeout_minutes_for_tier(tier)
-            ha_cfg = getattr(self, "cfg_d", {}).get("ha_exit", {})
-            override_timeout = ha_cfg.get("override_timeout", ha_cfg.get("HA_OVERRIDES_TIMEOUT", False))
-            moved = (float(s["entry"]) - low) / float(s["entry"]) if s["entry"] else 0.0
-            tp_pct = getattr(self, "tp_pct", 0.0)
-            tp_ok = moved >= tp_pct if tp_pct > 0 else False
-            ha5m_bar = getattr(self, "ha5m", None)
-            ha_favors_short = False
-            if ha5m_bar and hasattr(ha5m_bar, "prev_ha_open") and ha5m_bar.prev_ha_open is not None:
-                ha_favors_short = ha5m_bar.prev_ha_close < ha5m_bar.prev_ha_open
-            if timeout_min > 0 and self._elapsed_minutes(s, ts) >= timeout_min:
-                if not (override_timeout and tp_ok and ha_favors_short):
-                    out.append({"action": "COVER", "symbol": symbol, "qty": "ALL", "type": "MKT",
-                                "ts": ts, "reason": f"timeout_{timeout_min}min"})
-                    self._flat(symbol, reason=f"timeout_{timeout_min}min", ts=ts)
-                    return out
+        # Safer BE/trailing logic for SHORT
+        entry = float(s["entry"])
+        stop  = float(s["stop"])
+        R = abs(stop - entry)
+        favorable_move = entry - close  # lower is better for shorts
 
-            # Management helpers
-            # --- Safer BE/trailing logic for SHORT ---
-            R = abs(stop - entry)
-            favorable_move = entry - close  # for short, lower is better
-
-            # 1) Move stop to BE only after 0.75R favorable
-            if favorable_move >= 0.75 * R:
-                proposed = min(stop, entry)  # for short, lower = tighter
-                if proposed < stop:
-                    stop = self._set_stop("SHORT", symbol, ts, close, proposed, entry, stop, reason="be_0.75R")
-                    s["stop"] = stop
-                    s["be_active"] = True
-
-            # 2) Trail by ATR only after 1.5R favorable
-            if favorable_move >= 1.5 * R:
-                proposed = min(stop, close + 1.0 * atrv)
-                if proposed < stop:
-                    stop = self._set_stop("SHORT", symbol, ts, close, proposed, entry, stop, reason="trail_atr_1.5R")
-                    s["stop"] = stop
-
-            # --- Ratchet/trailing stop (SHORT) ---
-            self._maybe_ratchet_stop("short", s, close, atrv, getattr(self.cfg, "ratchet_pct_short", 4.0))
-            self._apply_ratchet(symbol, s, close, ts)
-
-            # 3) hard stop
-            if high >= s["stop"]:
-                be_exit = s.get("be_active", False) and abs(s["stop"] - entry) <= max(1e-6, 1e-6 * entry)
-                self._flat(symbol, reason="stop_hit", ts=ts)
-                out.append({"action":"COVER", "symbol":symbol, "qty":"ALL", "type":"MKT",
-                            "ts": ts, "reason":"stop_hit", "stop": s["stop"]})
-                self._dbg(symbol, last, tag="EXIT_STOP", extra={"stop": f"{s['stop']:.4f}", "high": f"{high:.4f}"})
-                if be_exit and getattr(self.cfg, "allow_reentry_after_be", False):
-                    s["allow_reentry_short"] = True
-                return out
-
-            # 4) partials   SHORT (cumulative-of-original)
-            filled = int(s.get("took_partial", 0))
-            moved  = (float(s["entry"]) - low) / float(s["entry"]) if s["entry"] else 0.0
-            levels = list(self.cfg_d.get("partial_levels", []))
-
-            while filled < len(levels) and s["size"] > 0:
-                lvl = levels[filled]
-                if moved < float(lvl["move_pct"]):
-                    break
-
-                orig = int(s.get("orig_size", s["size"]))
-                exited_so_far = orig - s["size"]
-                cum_frac = sum(float(levels[i]["exit_fraction"]) for i in range(filled + 1))
-                target_exited = int(round(orig * cum_frac))
-                qty = max(0, min(target_exited - exited_so_far, s["size"]))
-
-                if getattr(self, "debug_partials", False):
-                    self._log(f"[PARTIAL DEBUG] lvl={filled+1} mv={float(lvl['move_pct']):.4f} "
-                              f"orig={orig} sold_so_far={exited_so_far} desired_cum={target_exited} to_sell={qty}")
-
-                if qty <= 0:
-                    break
-
-                s["size"] -= qty
-                out.append({"action": "BUY_TO_COVER", "symbol": symbol, "qty": qty, "type": "MKT",
-                            "ts": ts, "reason": f"partial_{filled+1}_at_{float(lvl['move_pct'])*100:.2f}%"})
-                self._dbg(symbol, last, tag="PARTIAL",
-                          extra={"level": filled+1, "exit_frac": lvl["exit_fraction"], "qty": qty, "rem": s["size"]})
-
-                filled += 1
-                if getattr(self.cfg, "partial_one_per_bar", False):
-                    break
-
-            s["took_partial"] = filled
-            if s["size"] == 0:
-                self._flat(symbol, reason="all_partials_exit", ts=ts)
-                return out
-
-            # --- Ratchet/trailing stop (SHORT) after partials ---
-            self._maybe_ratchet_stop("short", s, close, atrv, getattr(self.cfg, "ratchet_pct_short", 4.0))
-
-            # 5) BE activation after N partials (legacy logic, can be removed if not needed)
-            if s["size"] > 0 and filled >= int(getattr(self.cfg, "be_after_partials", 0)):
-                proposed = min(s["stop"], entry)
-                # Clamp BE for SHORT: never above entry
-                proposed = min(proposed, entry)
-                s["stop"]  = self._set_stop("SHORT", symbol, ts, close, proposed, entry, s["stop"], reason="be_after_partials")
+        # 1) Move stop to BE only after 0.75R favorable
+        if favorable_move >= 0.75 * R:
+            proposed = min(stop, entry)  # for short, lower = tighter
+            if proposed < stop:
+                stop = self._set_stop("SHORT", symbol, ts, close, proposed, entry, stop, reason="be_0.75R")
+                s["stop"] = stop
                 s["be_active"] = True
 
-            # 6) bias exit (cross up)
-            bullish_cross = (p_ema9 <= p_ema20) and (ema9 > p_ema20)
-            if bullish_cross and getattr(self.cfg, "bias_exit_on_cross", False):
-                self._flat(symbol, reason="bias_exit", ts=ts)
-                out.append({"action":"COVER", "symbol":symbol, "qty":"ALL", "type":"MKT", "ts": ts, "reason":"bias_exit"})
-                self._dbg(symbol, last, tag="EXIT_BIAS")
-                return out
+        # 2) Trail by ATR only after 1.5R favorable
+        if favorable_move >= 1.5 * R:
+            proposed = min(stop, close + 1.0 * atrv)
+            if proposed < stop:
+                stop = self._set_stop("SHORT", symbol, ts, close, proposed, entry, stop, reason="trail_atr_1.5R")
+                s["stop"] = stop
 
-            return None
+        # Ratchet/trailing stop (SHORT)
+        self._maybe_ratchet_stop("short", s, close, atrv, getattr(self.cfg, "ratchet_pct_short", 4.0))
+        self._apply_ratchet(symbol, s, close, ts)
+
+        # 3) hard stop
+        if high >= s["stop"]:
+            be_exit = s.get("be_active", False) and abs(s["stop"] - entry) <= max(1e-6, 1e-6 * entry)
+            self._flat(symbol, reason="stop_hit", ts=ts)
+            out.append({"action":"COVER", "symbol":symbol, "qty":"ALL", "type":"MKT",
+                        "ts": ts, "reason":"stop_hit", "stop": s["stop"]})
+            self._dbg(symbol, last, tag="EXIT_STOP", extra={"stop": f"{s['stop']:.4f}", "high": f"{high:.4f}"})
+            if be_exit and getattr(self.cfg, "allow_reentry_after_be", False):
+                s["allow_reentry_short"] = True
+            return out
+
+        # 4) partials SHORT (cumulative-of-original)
+        filled = int(s.get("took_partial", 0))
+        moved  = (float(s["entry"]) - low) / float(s["entry"]) if s["entry"] else 0.0
+        levels = list(self.cfg_d.get("partial_levels", []))
+        while filled < len(levels) and s["size"] > 0:
+            lvl = levels[filled]
+            if moved < float(lvl["move_pct"]):
+                break
+            orig = int(s.get("orig_size", s["size"]))
+            exited_so_far = orig - s["size"]
+            cum_frac = sum(float(levels[i]["exit_fraction"]) for i in range(filled + 1))
+            target_exited = int(round(orig * cum_frac))
+            qty = max(0, min(target_exited - exited_so_far, s["size"]))
+            if getattr(self, "debug_partials", False):
+                self._log(f"[PARTIAL DEBUG] lvl={filled+1} mv={float(lvl['move_pct']):.4f} "
+                        f"orig={orig} sold_so_far={exited_so_far} desired_cum={target_exited} to_sell={qty}")
+            if qty <= 0:
+                break
+            s["size"] -= qty
+            out.append({"action": "BUY_TO_COVER", "symbol": symbol, "qty": qty, "type": "MKT",
+                        "ts": ts, "reason": f"partial_{filled+1}_at_{float(lvl['move_pct'])*100:.2f}%"})
+            self._dbg(symbol, last, tag="PARTIAL",
+                    extra={"level": filled+1, "exit_frac": lvl["exit_fraction"], "qty": qty, "rem": s["size"]})
+            filled += 1
+            if getattr(self.cfg, "partial_one_per_bar", False):
+                break
+        s["took_partial"] = filled
+        if s["size"] == 0:
+            self._flat(symbol, reason="all_partials_exit", ts=ts)
+            return out
+
+        # Ratchet/trailing stop (SHORT) after partials
+        self._maybe_ratchet_stop("short", s, close, atrv, getattr(self.cfg, "ratchet_pct_short", 4.0))
+
+        # 5) BE activation after N partials (legacy logic, can be removed if not needed)
+        if s["size"] > 0 and filled >= int(getattr(self.cfg, "be_after_partials", 0)):
+            proposed = min(s["stop"], entry)
+            # Clamp BE for SHORT: never above entry
+            proposed = min(proposed, entry)
+            s["stop"]  = self._set_stop("SHORT", symbol, ts, close, proposed, entry, s["stop"], reason="be_after_partials")
+            s["be_active"] = True
+
+        # 6) bias exit (cross up) - Note: you'll need to define p_ema9, p_ema20, ema9 variables
+        # bullish_cross = (p_ema9 <= p_ema20) and (ema9 > p_ema20)
+        # if bullish_cross and getattr(self.cfg, "bias_exit_on_cross", False):
+        #     self._flat(symbol, reason="bias_exit", ts=ts)
+        #     out.append({"action":"COVER", "symbol":symbol, "qty":"ALL", "type":"MKT", "ts": ts, "reason":"bias_exit"})
+        #     self._dbg(symbol, last, tag="EXIT_BIAS")
+        #     return out
+
+        return out
 
     def _elapsed_minutes(self, s: dict, ts) -> float:
         entered = s.get("entered_at")
         if not entered:
             return 0.0
         return (self._as_utc(ts) - self._as_utc(entered)).total_seconds() / 60.0
+    
+    def _timeout_minutes_for_tier(self, tier) -> int:
+        """
+        Return timeout minutes for a given tier (e.g., 'A','B','C','D').
+        Supports several config shapes; falls back to 0 (disabled).
+        """
+        t = str(tier).upper() if tier is not None else "B"
+        cfg = getattr(self, "cfg_d", {}) or {}
 
+        # Newer-style: dictionary mappings
+        mapping = (
+            cfg.get("timeout_minutes_by_tier")
+            or cfg.get("timeouts")
+            or cfg.get("timeout_minutes")
+        )
+        if isinstance(mapping, dict):
+            # try exact uppercase, then lowercase
+            if t in mapping: 
+                return int(mapping[t])
+            if t.lower() in mapping: 
+                return int(mapping[t.lower()])
+
+        # Legacy flat keys (accept a few common variants)
+        for k in (
+            f"timeout_minutes_{t}",
+            f"timeout_{t}",
+            f"tier_{t.lower()}_timeout_minutes",
+        ):
+            if k in cfg:
+                return int(cfg[k])
+
+        # Single numeric fallback (e.g. "timeout_minutes": 15)
+        if isinstance(cfg.get("timeout_minutes"), (int, float)):
+            return int(cfg["timeout_minutes"])
+
+        # Default: 0 disables the timeout
+        return 0
+
+    
     # --- Break-even with min-minutes gate ---
     def _maybe_activate_be(self, symbol: str, s: dict, ts) -> None:
         # New logic: BOTH min_minutes and partials_taken must be satisfied before BE activates
@@ -659,6 +691,24 @@ class StrategyV13(StrategyBase):
                              "reason": f"ratchet_{trigger_move_pct*100:.1f}%",
                              "cushion_pct": f"{cushion_pct*100:.2f}%"})
         return new_stop
+
+    # Put this BELOW the existing new-style _apply_ratchet definition
+    def _apply_ratchet(self, *args, **kwargs):
+        """
+        Compatibility wrapper: supports both the new signature
+        (side, price, prev_stop, entry, trigger_move_pct, cushion_pct, sym=None, ts=None)
+        and the old signature
+        (symbol, s, price, ts)  -> delegates to _apply_ratchet_old(...)
+        """
+        # New-style: first arg is side string, second arg is a number (price), not a dict
+        if len(args) >= 6 and isinstance(args[0], str) and not isinstance(args[1], dict):
+            # Delegate to the new-style body you already have (assumes it is named _apply_ratchet_impl)
+            return self._apply_ratchet_impl(*args, **kwargs)  # see note below
+
+        # Old-style
+        symbol, s, price, ts = args[:4]
+        return self._apply_ratchet_old(symbol, s, price, ts)
+
 
     def _apply_ratchet_old(self, symbol: str, s: dict, price: float, ts) -> None:
         rcfg = getattr(self.cfg, "ratchet", {}) or {}
@@ -1102,348 +1152,352 @@ class StrategyV13(StrategyBase):
 
     def on_bar(self, symbol: str, bar: Bar) -> Optional[Iterable[Dict[str, Any]]]:
 
-        self._ensure_state()
+            self._ensure_state()
+            
+            
+
+            # --- set current bar time for logging ---
+            ts = getattr(bar, "ts", None)
+            if ts is None and isinstance(bar, dict):
+                ts = bar.get("ts")
+            self._set_now(ts)
+
+            # --- prepare state/buffers ---
+            df = self.buffers[symbol]
+            s  = self.state[symbol]
+            out: List[Dict[str, Any]] = []
+
+            # Normalize timestamp to UTC pandas Timestamp
+            ts = pd.Timestamp(bar["timestamp"])
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            else:
+                ts = ts.tz_convert("UTC")
+
+            # Append bar to buffer
+            row_dict = {
+                "timestamp": ts,
+                "open":  float(bar.get("open",  bar["close"])),
+                "high":  float(bar.get("high",  bar["close"])),
+                "low":   float(bar.get("low",   bar["close"])),
+                "close": float(bar["close"]),
+                "volume": float(bar.get("volume", 0.0)),
+            }
+            # Extract values to avoid naming conflicts with built-ins
+            open_val = row_dict["open"]
+            high_val = row_dict["high"]
+            low_val = row_dict["low"]
+            close_val = row_dict["close"]
         
-        
-
-        # --- set current bar time for logging ---
-        ts = getattr(bar, "ts", None)
-        if ts is None and isinstance(bar, dict):
-            ts = bar.get("ts")
-        self._set_now(ts)
-
-        # --- prepare state/buffers ---
-        df = self.buffers[symbol]
-        s  = self.state[symbol]
-        out: List[Dict[str, Any]] = []
-
-        # Normalize timestamp to UTC pandas Timestamp
-        ts = pd.Timestamp(bar["timestamp"])
-        if ts.tzinfo is None:
-            ts = ts.tz_localize("UTC")
-        else:
-            ts = ts.tz_convert("UTC")
-
-        # Append bar to buffer
-        row_dict = {
-            "timestamp": ts,
-            "open":  float(bar.get("open",  bar["close"])),
-            "high":  float(bar.get("high",  bar["close"])),
-            "low":   float(bar.get("low",   bar["close"])),
-            "close": float(bar["close"]),
-            "volume": float(bar.get("volume", 0.0)),
-        }
-        # Extract values to avoid naming conflicts with built-ins
-        open_val = row_dict["open"]
-        high_val = row_dict["high"]
-        low_val = row_dict["low"]
-        close_val = row_dict["close"]
-    
-        # Update HA5m for this symbol
-        ha5m_obj = self.ha5m[symbol]
-        ha_bar = ha5m_obj.update(ts, open_val, high_val, low_val, close_val)
-        df.loc[len(df)] = row_dict
+            # Update HA5m for this symbol
+            ha5m_obj = self.ha5m[symbol]
+            ha_bar = ha5m_obj.update(ts, open_val, high_val, low_val, close_val)
+            df.loc[len(df)] = row_dict
 
 
-        # ---- context needed by the logic below ----
-        # Use the last row in the DataFrame for all references
-        row = df.iloc[-1]
-        last = row.to_dict()
-        self._last_ts = getattr(bar, "ts", None) or last.get("ts")
-        s = self.state[symbol]                          # per-symbol state (dict)
-        ts = self._as_utc(row["timestamp"])            # timestamp for this bar (UTC)
+            # ---- context needed by the logic below ----
+            # Use the last row in the DataFrame for all references
+            row = df.iloc[-1]
+            last = row.to_dict()
+            self._last_ts = getattr(bar, "ts", None) or last.get("ts")
+            s = self.state[symbol]                          # per-symbol state (dict)
+            ts = self._as_utc(row["timestamp"])            # timestamp for this bar (UTC)
 
-        close = row["close"]
-        open_ = row["open"]
-        high = row["high"]
-        low = row["low"]
-        # -------------------------------------------
-        closes = df["close"]
-        ema9_series  = closes.ewm(span=9,  adjust=False).mean()
-        ema20_series = closes.ewm(span=20, adjust=False).mean()
-        ema9  = float(ema9_series.iloc[-1])
-        ema20 = float(ema20_series.iloc[-1])
-        p_ema9  = float(ema9_series.iloc[-2])  if len(ema9_series)  > 1 else ema9
-        p_ema20 = float(ema20_series.iloc[-2]) if len(ema20_series) > 1 else ema20
+            close = row["close"]
+            open_ = row["open"]
+            high = row["high"]
+            low = row["low"]
+            # -------------------------------------------
+            closes = df["close"]
+            ema9_series  = closes.ewm(span=9,  adjust=False).mean()
+            ema20_series = closes.ewm(span=20, adjust=False).mean()
+            ema9  = float(ema9_series.iloc[-1])
+            ema20 = float(ema20_series.iloc[-1])
+            p_ema9  = float(ema9_series.iloc[-2])  if len(ema9_series)  > 1 else ema9
+            p_ema20 = float(ema20_series.iloc[-2]) if len(ema20_series) > 1 else ema20
 
-        # MACD(12,26,9)
-        ema12 = closes.ewm(span=12, adjust=False).mean()
-        ema26 = closes.ewm(span=26, adjust=False).mean()
-        macd_line = ema12 - ema26
-        sig_line  = macd_line.ewm(span=9, adjust=False).mean()
-        macd_now = float(macd_line.iloc[-1])
-        sig_now  = float(sig_line.iloc[-1])
+            # MACD(12,26,9)
+            ema12 = closes.ewm(span=12, adjust=False).mean()
+            ema26 = closes.ewm(span=26, adjust=False).mean()
+            macd_line = ema12 - ema26
+            sig_line  = macd_line.ewm(span=9, adjust=False).mean()
+            macd_now = float(macd_line.iloc[-1])
+            sig_now  = float(sig_line.iloc[-1])
 
-        # ATR(14)
-        hi = df["high"]; lo = df["low"]; cl = df["close"]
-        prev_close = cl.shift(1)
-        tr = pd.concat([
-            (hi - lo).abs(),
-            (hi - prev_close).abs(),
-            (lo - prev_close).abs()
-        ], axis=1).max(axis=1)
-        atr_series = tr.ewm(span=14, adjust=False).mean()
-        atrv = float(atr_series.iloc[-1])
-        fill_px = close  # parity: log minute close as the fill
-        # VWAP (session cumulative)
-        typical = (hi + lo + cl) / 3.0
-        vol = df["volume"].fillna(0.0)
-        tpv = (typical * vol).cumsum()
-        cv  = vol.cumsum().replace(0, np.nan)
-        vwap_series = (tpv / cv).fillna(cl)
-        vwap_val = float(vwap_series.iloc[-1])
-        above_vwap = close >= vwap_val
-        below_vwap = close <  vwap_val
+            # ATR(14)
+            hi = df["high"]; lo = df["low"]; cl = df["close"]
+            prev_close = cl.shift(1)
+            tr = pd.concat([
+                (hi - lo).abs(),
+                (hi - prev_close).abs(),
+                (lo - prev_close).abs()
+            ], axis=1).max(axis=1)
+            atr_series = tr.ewm(span=14, adjust=False).mean()
+            atrv = float(atr_series.iloc[-1])
+            fill_px = close  # parity: log minute close as the fill
+            # VWAP (session cumulative)
+            typical = (hi + lo + cl) / 3.0
+            vol = df["volume"].fillna(0.0)
+            tpv = (typical * vol).cumsum()
+            cv  = vol.cumsum().replace(0, np.nan)
+            vwap_series = (tpv / cv).fillna(cl)
+            vwap_val = float(vwap_series.iloc[-1])
+            above_vwap = close >= vwap_val
+            below_vwap = close <  vwap_val
 
-        # --- auto-tier and cross-age tracking ---
-        self._update_cross_age(symbol, ema9, ema20)
-        tier_raw = self._tier_for_context(symbol, row, ema9, ema20, vwap_val, macd_now, sig_now)
-        tier_id = self._as_tier_id(tier_raw)
-        if tier_id is None:
-            return  # or skip entry
-        self._last_entry_tier[symbol] = tier_id
+            # --- auto-tier and cross-age tracking ---
+            self._update_cross_age(symbol, ema9, ema20)
+            tier_raw = self._tier_for_context(symbol, row, ema9, ema20, vwap_val, macd_now, sig_now)
+            tier_id = self._as_tier_id(tier_raw)
+            if tier_id is not None:
+                self._last_entry_tier[symbol] = tier_id
 
-        # Pack 'last' for _dbg / _maybe_exit_ha
-        last = {
-            "timestamp": ts,
-            "open": open_,
-            "high": high,
-            "low": low,
-            "close": close,
-            "ema_9": ema9,
-            "ema_20": ema20,
-            "macd": macd_now,
-            "macd_signal": sig_now,
-            "vwap": vwap_val,
-            "atr": atrv,
-        }
 
-        # ---------- entries (only when flat) ----------
-        if s["pos"] == 0:
-            can_enter = True
-            if getattr(self, "entry_start_utc", None) is not None and getattr(self, "entry_end_utc", None) is not None:
-                can_enter = (self.entry_start_utc <= ts <= self.entry_end_utc)
+            # Pack 'last' for _dbg / _maybe_exit_ha
+            last = {
+                "timestamp": ts,
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+                "ema_9": ema9,
+                "ema_20": ema20,
+                "macd": macd_now,
+                "macd_signal": sig_now,
+                "vwap": vwap_val,
+                "atr": atrv,
+            }
 
-            if getattr(self.cfg, "debug_signals", True):
-                every = int(self.cfg_d.get("trace_every_n", 1))
-                self._trace_i = getattr(self, "_trace_i", 0) + 1
-                if every <= 1 or (self._trace_i % every == 0) or can_enter:
-                    print(f"[TRACE] gate | ts={ts} | can_enter={can_enter}")
-
-            if can_enter:
-                # reset any previous tier flag for this evaluation
-                self._last_entry_tier.pop(symbol, None)
-                # LONG signal
-                bullish_cross = (p_ema9 <= p_ema20) and (ema9 > ema20)
-                long_ok = bullish_cross and (macd_now > sig_now)
-                if getattr(self.cfg, "vwap_filter", False):
-                    long_ok = long_ok and above_vwap
-                can_long = (s["entries_long"] < getattr(self.cfg, "max_trades_per_dir", 1)) or s.get("allow_reentry_long", False)
-
-                # SHORT signal
-                allow_shorts = getattr(self.cfg, "allow_shorts", True)
-                short_ok = False; can_short = False
-                if allow_shorts:
-                    bearish_cross = (p_ema9 >= p_ema20) and (ema9 < ema20)
-                    short_ok = bearish_cross and (macd_now < sig_now)
-                    if getattr(self.cfg, "vwap_filter", False):
-                        short_ok = short_ok and below_vwap
-                    can_short = (s["entries_short"] < getattr(self.cfg, "max_trades_per_dir", 1)) or s.get("allow_reentry_short", False)
+            # ---------- entries (only when flat) ----------
+            if s["pos"] == 0:
+                can_enter = True
+                if getattr(self, "entry_start_utc", None) is not None and getattr(self, "entry_end_utc", None) is not None:
+                    can_enter = (self.entry_start_utc <= ts <= self.entry_end_utc)
 
                 if getattr(self.cfg, "debug_signals", True):
-                    self._log(
-                        f"[TRACE] sig | long_ok={long_ok} short_ok={short_ok} "
-                        f"vwap_filter={getattr(self.cfg, 'vwap_filter', False)} "
-                        f"allow_shorts={allow_shorts}"
-                    )
+                    every = int(self.cfg_d.get("trace_every_n", 60))  # ~once/min by default
+                    self._trace_i = getattr(self, "_trace_i", 0) + 1
+                    should_trace = (self._trace_i % every == 0) or can_enter or (s["pos"] != 0)
+                    if should_trace:
+                        print(f"[TRACE] gate | ts={ts} | can_enter={can_enter}")
 
-                    s["entries_long"] += 1
-                    out.append({
-                        "action": "BUY", "symbol": symbol, "qty": size, "type": "MKT",
-                        "ts": ts, "entry": entry, "stop": stop,
-                        "reason": "ema9>ema20 + macd>sig" + (
-                            " + vwap" if getattr(self.cfg, "vwap_filter", False) else ""
+                if can_enter:
+                    # reset any previous tier flag for this evaluation
+                    self._last_entry_tier.pop(symbol, None)
+                    # LONG signal
+                    bullish_cross = (p_ema9 <= p_ema20) and (ema9 > ema20)
+                    long_ok = bullish_cross and (macd_now > sig_now)
+                    if getattr(self.cfg, "vwap_filter", False):
+                        long_ok = long_ok and above_vwap
+                    can_long = (s["entries_long"] < getattr(self.cfg, "max_trades_per_dir", 1)) or s.get("allow_reentry_long", False)
+
+                    # SHORT signal
+                    allow_shorts = getattr(self.cfg, "allow_shorts", True)
+                    short_ok = False; can_short = False
+                    if allow_shorts:
+                        bearish_cross = (p_ema9 >= p_ema20) and (ema9 < ema20)
+                        short_ok = bearish_cross and (macd_now < sig_now)
+                        if getattr(self.cfg, "vwap_filter", False):
+                            short_ok = short_ok and below_vwap
+                        can_short = (s["entries_short"] < getattr(self.cfg, "max_trades_per_dir", 1)) or s.get("allow_reentry_short", False)
+
+                    if getattr(self.cfg, "debug_signals", True):
+                        self._log(
+                            f"[TRACE] sig | long_ok={long_ok} short_ok={short_ok} "
+                            f"vwap_filter={getattr(self.cfg, 'vwap_filter', False)} "
+                            f"allow_shorts={allow_shorts}"
                         )
-                    })
-                    self._dbg(
-                        symbol, last, tag="BUY",
-                        extra={
-                            "entry": f"{entry:.4f}", "stop": f"{stop:.4f}",
-                            "R": f"{entry - stop:.4f}", "size": size
-                        }
-                    )
+
+                    # === PROPER LONG ENTRY (compute entry/stop/size before use) ===
+                    if long_ok and can_long:
+                        entry = fill_px
+                        sl_pct = self.get_sl_pct_for_tier("B")
+                        stop = entry * (1.0 - sl_pct)
+                        size = self._compute_position_size(symbol=symbol, entry=entry, stop=stop, direction=+1)
+                        s.update({
+                            "pos": +1, "entry": entry, "stop": stop, "r": max(1e-9, entry - stop),
+                            "size": size, "orig_size": size, "took_partial": 0, "be_active": False,
+                            "side": "BUY", "symbol": symbol, "best": entry
+                        })
+                        if s.get("allow_reentry_long"): 
+                            s["allow_reentry_long"] = False
+                        else: 
+                            s["entries_long"] += 1
+                        out.append({
+                            "action": "BUY", "symbol": symbol, "qty": size, "type": "MKT",
+                            "ts": ts, "entry": entry, "stop": stop,
+                            "reason": "ema9>ema20 + macd>sig" + (
+                                " + vwap" if getattr(self.cfg, "vwap_filter", False) else ""
+                            )
+                        })
+                        self._dbg(
+                            symbol, last, tag="BUY",
+                            extra={
+                                "entry": f"{entry:.4f}", "stop": f"{stop:.4f}",
+                                "R": f"{entry - stop:.4f}", "size": size
+                            }
+                        )
+                        return out
+
+                    if short_ok and can_short:
+                        entry = fill_px
+                        # self._last_entry_tier[symbol] = "B"  # redundant, already set by auto-tier
+                        sl_pct = self.get_sl_pct_for_tier("B")
+                        stop = entry * (1.0 + sl_pct)
+                        size = self._compute_position_size(symbol=symbol, entry=entry, stop=stop, direction=-1)
+                        s.update({
+                            "pos": -1, "entry": entry, "stop": stop, "r": max(1e-9, stop - entry),
+                            "size": size, "orig_size": size, "took_partial": 0, "be_active": False,
+                            "side": "SELL_SHORT", "symbol": symbol, "best": entry
+                        })
+                        if s.get("allow_reentry_short"): s["allow_reentry_short"] = False
+                        else: s["entries_short"] += 1
+                        out.append({"action":"SELL_SHORT", "symbol":symbol, "qty":size, "type":"MKT",
+                                    "ts": ts, "entry": entry, "stop": stop,
+                                    "reason":"ema9<ema20 + macd<sig" + (" + vwap" if getattr(self.cfg, "vwap_filter", False) else "")})
+                        self._dbg(symbol, last, tag="SELL_SHORT", extra={"entry": f"{entry:.4f}", "stop": f"{stop:.4f}", "R": f"{stop-entry:.4f}", "size": size})
+                        return out
+            # ---------- manage LONG ----------
+            if s["pos"] == +1:
+                entry = float(s["entry"]); stop = float(s["stop"])
+
+                # HA(5m) exit precedence
+                if self._maybe_exit_ha(symbol, s, last):
+                    out.append({"action": "SELL", "symbol": symbol, "qty": "ALL", "type": "MKT",
+                                "ts": ts, "reason": "exit_ha_5m"})
+                    self._flat(symbol, reason="exit_ha_5m", ts=ts)
                     return out
 
-                if short_ok and can_short:
-                    entry = fill_price
-                    # self._last_entry_tier[symbol] = "B"  # redundant, already set by auto-tier
-                    sl_pct = self.get_sl_pct_for_tier("B")
-                    stop = entry * (1.0 + sl_pct)
-                    size = self._compute_position_size(symbol=symbol, entry=entry, stop=stop, direction=-1)
-                    s.update({
-                        "pos": -1, "entry": entry, "stop": stop, "r": max(1e-9, stop - entry),
-                        "size": size, "orig_size": size, "took_partial": 0, "be_active": False,
-                        "side": "SELL_SHORT", "symbol": symbol, "best": entry
-                    })
-                    if s.get("allow_reentry_short"): s["allow_reentry_short"] = False
-                    else: s["entries_short"] += 1
-                    out.append({"action":"SELL_SHORT", "symbol":symbol, "qty":size, "type":"MKT",
-                                "ts": ts, "entry": entry, "stop": stop,
-                                "reason":"ema9<ema20 + macd<sig" + (" + vwap" if getattr(self.cfg, "vwap_filter", False) else "")})
-                    self._dbg(symbol, last, tag="SELL_SHORT", extra={"entry": f"{entry:.4f}", "stop": f"{stop:.4f}", "R": f"{stop-entry:.4f}", "size": size})
-                    return out
-        # ---------- manage LONG ----------
-        if s["pos"] == +1:
-            entry = float(s["entry"]); stop = float(s["stop"])
-
-            # HA(5m) exit precedence
-            if self._maybe_exit_ha(symbol, s, last):
-                out.append({"action": "SELL", "symbol": symbol, "qty": "ALL", "type": "MKT",
-                            "ts": ts, "reason": "exit_ha_5m"})
-                self._flat(symbol, reason="exit_ha_5m", ts=ts)
-                return out
-
-            # Timeout exit (after HA override)
-            tier = self._last_entry_tier.get(symbol, "A")
-            timeout_min = self._timeout_minutes_for_tier(tier)
-            ha_cfg = getattr(self, "cfg_d", {}).get("ha_exit", {})
-            override_timeout = ha_cfg.get("override_timeout", ha_cfg.get("HA_OVERRIDES_TIMEOUT", False))
-            moved = (high - float(s["entry"])) / float(s["entry"]) if s["entry"] else 0.0
-            tp_pct = getattr(self, "tp_pct", 0.0)
-            tp_ok = moved >= tp_pct if tp_pct > 0 else False
-            # Get last closed 5m HA bar
-            ha5m_bar = getattr(self, "ha5m", None)
-            ha_favors_long = False
-            if ha5m_bar and hasattr(ha5m_bar, "prev_ha_open") and ha5m_bar.prev_ha_open is not None:
-                ha_favors_long = ha5m_bar.prev_ha_close > ha5m_bar.prev_ha_open
-            if timeout_min > 0 and self._elapsed_minutes(s, ts) >= timeout_min:
-                # --- HA vs Timeout precedence (parity with old) ---
+                # Timeout exit (after HA override)
+                tier = self._last_entry_tier.get(symbol, "A")
+                timeout_min = self._timeout_minutes_for_tier(tier)
                 ha_cfg = getattr(self, "cfg_d", {}).get("ha_exit", {})
                 override_timeout = ha_cfg.get("override_timeout", ha_cfg.get("HA_OVERRIDES_TIMEOUT", False))
                 moved = (high - float(s["entry"])) / float(s["entry"]) if s["entry"] else 0.0
                 tp_pct = getattr(self, "tp_pct", 0.0)
                 tp_ok = moved >= tp_pct if tp_pct > 0 else False
+                # Get last closed 5m HA bar
                 ha5m_bar = getattr(self, "ha5m", None)
                 ha_favors_long = False
                 if ha5m_bar and hasattr(ha5m_bar, "prev_ha_open") and ha5m_bar.prev_ha_open is not None:
                     ha_favors_long = ha5m_bar.prev_ha_close > ha5m_bar.prev_ha_open
-                if not (override_timeout and tp_ok and ha_favors_long):
-                    out.append({"action": "SELL", "symbol": symbol, "qty": "ALL", "type": "MKT",
-                                "ts": ts, "reason": f"timeout_{timeout_min}min"})
-                    self._flat(symbol, reason=f"timeout_{timeout_min}min", ts=ts)
+                if timeout_min > 0 and self._elapsed_minutes(s, ts) >= timeout_min:
+                    # --- HA vs Timeout precedence (parity with old) ---
+                    ha_cfg = getattr(self, "cfg_d", {}).get("ha_exit", {})
+                    override_timeout = ha_cfg.get("override_timeout", ha_cfg.get("HA_OVERRIDES_TIMEOUT", False))
+                    moved = (high - float(s["entry"])) / float(s["entry"]) if s["entry"] else 0.0
+                    tp_pct = getattr(self, "tp_pct", 0.0)
+                    tp_ok = moved >= tp_pct if tp_pct > 0 else False
+                    ha5m_bar = ha_bar
+                    ha_favors_long = False
+                    if ha5m_bar and hasattr(ha5m_bar, "prev_ha_open") and ha5m_bar.prev_ha_open is not None:
+                        ha_favors_long = ha5m_bar.prev_ha_close > ha5m_bar.prev_ha_open
+                    if not (override_timeout and tp_ok and ha_favors_long):
+                        out.append({"action": "SELL", "symbol": symbol, "qty": "ALL", "type": "MKT",
+                                    "ts": ts, "reason": f"timeout_{timeout_min}min"})
+                        self._flat(symbol, reason=f"timeout_{timeout_min}min", ts=ts)
+                        return out
+
+                # Management helpers
+                self._maybe_activate_be(symbol, s, ts)
+                # --- Ratchet/trailing stop (LONG) ---
+                self._maybe_ratchet_stop("long", s, close, ts, atrv, getattr(self.cfg, "ratchet_pct_long", 4.0))
+                self._apply_ratchet(symbol, s, close, ts)
+
+                # 1) hard stop
+                if low <= stop:
+                    be_exit = s.get("be_active", False) and abs(s["stop"] - entry) <= max(1e-6, 1e-6 * entry)
+                    self._flat(symbol, reason="stop_hit", ts=ts)
+                    out.append({"action":"SELL", "symbol":symbol, "qty":"ALL", "type":"MKT",
+                                "ts": ts, "reason":"stop_hit", "stop": stop})
+                    self._dbg(symbol, last, tag="EXIT_STOP", extra={"stop": f"{stop:.4f}", "low": f"{low:.4f}"})
+                    if be_exit and getattr(self.cfg, "allow_reentry_after_be", False):
+                        s["allow_reentry_long"] = True
                     return out
 
-            # Management helpers
-            self._maybe_activate_be(symbol, s, ts)
-            # --- Ratchet/trailing stop (LONG) ---
-            self._maybe_ratchet_stop("long", s, close, ts, atrv, getattr(self.cfg, "ratchet_pct_long", 4.0))
-            self._apply_ratchet(symbol, s, close, ts)
-
-            # 1) hard stop
-            if low <= stop:
-                be_exit = s.get("be_active", False) and abs(s["stop"] - entry) <= max(1e-6, 1e-6 * entry)
-                self._flat(symbol, reason="stop_hit", ts=ts)
-                out.append({"action":"SELL", "symbol":symbol, "qty":"ALL", "type":"MKT",
-                            "ts": ts, "reason":"stop_hit", "stop": stop})
-                self._dbg(symbol, last, tag="EXIT_STOP", extra={"stop": f"{stop:.4f}", "low": f"{low:.4f}"})
-                if be_exit and getattr(self.cfg, "allow_reentry_after_be", False):
-                    s["allow_reentry_long"] = True
-                return out
-
-            # 2) trail stop by ATR (LONG   direction=+1)
-            new_stop = self._trail_stop(close, atrv, stop, direction=+1)
-            if new_stop > stop:
-                if s.get("be_active", False):
-                    # Never move stop below the entry price once BE is active
-                    new_stop = max(new_stop, float(s["entry"]))
-                s["stop"] = self._set_stop("LONG", symbol, ts, close, new_stop, s["entry"], stop, reason="trail_atr")
+                # 2) trail stop by ATR (LONG   direction=+1)
+                new_stop = self._trail_stop(close, atrv, stop, direction=+1)
+                if new_stop > stop:
+                    if s.get("be_active", False):
+                        # Never move stop below the entry price once BE is active
+                        new_stop = max(new_stop, float(s["entry"]))
+                    s["stop"] = self._set_stop("LONG", symbol, ts, close, new_stop, s["entry"], stop, reason="trail_atr")
 
 
-            # 3) partials (cumulative-of-original)   LONG
-            filled = int(s.get("took_partial", 0))
-            moved  = (high - float(s["entry"])) / float(s["entry"]) if s["entry"] else 0.0
-            levels = list(self.cfg_d.get("partial_levels", []))
+                # 3) partials (cumulative-of-original)   LONG
+                filled = int(s.get("took_partial", 0))
+                moved  = (high - float(s["entry"])) / float(s["entry"]) if s["entry"] else 0.0
+                levels = list(self.cfg_d.get("partial_levels", []))
 
-            while filled < len(levels) and s["size"] > 0:
-                lvl = levels[filled]
-                if moved < float(lvl["move_pct"]):
-                    break
+                while filled < len(levels) and s["size"] > 0:
+                    lvl = levels[filled]
+                    if moved < float(lvl["move_pct"]):
+                        break
 
-                orig = int(s.get("orig_size", s["size"]))
-                exited_so_far = orig - s["size"]
-                cum_frac = sum(float(levels[i]["exit_fraction"]) for i in range(filled + 1))
-                target_exited = int(round(orig * cum_frac))
-                qty = max(0, min(target_exited - exited_so_far, s["size"]))
+                    orig = int(s.get("orig_size", s["size"]))
+                    exited_so_far = orig - s["size"]
+                    cum_frac = sum(float(levels[i]["exit_fraction"]) for i in range(filled + 1))
+                    target_exited = int(round(orig * cum_frac))
+                    qty = max(0, min(target_exited - exited_so_far, s["size"]))
 
-                # (optional) debug
-                if getattr(self, "debug_partials", False):
-                    self._log(f"[PARTIAL DEBUG] lvl={filled+1} mv={float(lvl['move_pct']):.4f} "
-                              f"orig={orig} sold_so_far={exited_so_far} desired_cum={target_exited} to_sell={qty}")
+                    # (optional) debug
+                    if getattr(self, "debug_partials", False):
+                        self._log(f"[PARTIAL DEBUG] lvl={filled+1} mv={float(lvl['move_pct']):.4f} "
+                                f"orig={orig} sold_so_far={exited_so_far} desired_cum={target_exited} to_sell={qty}")
 
-                if qty <= 0:
-                    break
+                    if qty <= 0:
+                        break
 
-                s["size"] -= qty
-                out.append({"action": "SELL", "symbol": symbol, "qty": qty, "type": "MKT",
-                            "ts": ts, "reason": f"partial_{filled+1}_at_{float(lvl['move_pct'])*100:.2f}%"})
-                self._dbg(symbol, last, tag="PARTIAL",
-                          extra={"level": filled+1, "exit_frac": lvl["exit_fraction"], "qty": qty, "rem": s["size"]})
+                    s["size"] -= qty
+                    out.append({"action": "SELL", "symbol": symbol, "qty": qty, "type": "MKT",
+                                "ts": ts, "reason": f"partial_{filled+1}_at_{float(lvl['move_pct'])*100:.2f}%"})
+                    self._dbg(symbol, last, tag="PARTIAL",
+                            extra={"level": filled+1, "exit_frac": lvl["exit_fraction"], "qty": qty, "rem": s["size"]})
 
-                filled += 1
-                if getattr(self.cfg, "partial_one_per_bar", False):
-                    break
+                    filled += 1
+                    if getattr(self.cfg, "partial_one_per_bar", False):
+                        break
 
-            s["took_partial"] = filled
-            if s["size"] == 0:
-                self._flat(symbol, reason="all_partials_exit", ts=ts)
-                return out
+                s["took_partial"] = filled
+                if s["size"] == 0:
+                    self._flat(symbol, reason="all_partials_exit", ts=ts)
+                    return out
 
-            # --- Ratchet/trailing stop (LONG) after partials ---
-            self._maybe_ratchet_stop("long", s, close, ts, atrv, getattr(self.cfg, "ratchet_pct_long", 4.0))
+                # --- Ratchet/trailing stop (LONG) after partials ---
+                self._maybe_ratchet_stop("long", s, close, ts, atrv, getattr(self.cfg, "ratchet_pct_long", 4.0))
 
-            # 4) BE activation after N partials
-            if s["size"] > 0 and filled >= int(getattr(self.cfg, "be_after_partials", 0)):
-                proposed = max(s["stop"], entry)
-                # Clamp BE for LONG: never below entry
-                proposed = max(proposed, entry)
-                s["stop"]  = self._set_stop("LONG", symbol, ts, close, proposed, entry, s["stop"], reason="be_after_partials")
-                s["be_active"] = True
+                # 4) BE activation after N partials
+                if s["size"] > 0 and filled >= int(getattr(self.cfg, "be_after_partials", 0)):
+                    proposed = max(s["stop"], entry)
+                    # Clamp BE for LONG: never below entry
+                    proposed = max(proposed, entry)
+                    s["stop"]  = self._set_stop("LONG", symbol, ts, close, proposed, entry, s["stop"], reason="be_after_partials")
+                    s["be_active"] = True
 
-            # 5) bias exit (cross down)
-            bearish_cross = (p_ema9 >= p_ema20) and (ema9 < p_ema20)
-            if bearish_cross and getattr(self.cfg, "bias_exit_on_cross", False):
-                self._flat(symbol, reason="bias_exit", ts=ts)
-                out.append({"action":"SELL", "symbol":symbol, "qty":"ALL", "type":"MKT", "ts": ts, "reason":"bias_exit"})
-                self._dbg(symbol, last, tag="EXIT_BIAS")
-                return out
+                # 5) bias exit (cross down)
+                bearish_cross = (p_ema9 >= p_ema20) and (ema9 < ema20)
+                if bearish_cross and getattr(self.cfg, "bias_exit_on_cross", False):
+                    self._flat(symbol, reason="bias_exit", ts=ts)
+                    out.append({"action":"SELL", "symbol":symbol, "qty":"ALL", "type":"MKT", "ts": ts, "reason":"bias_exit"})
+                    self._dbg(symbol, last, tag="EXIT_BIAS")
+                    return out
 
-            return None
+                return None
 
-        # ---------- manage SHORT ----------
-        if s["pos"] == -1:
-            entry = float(s["entry"]); stop = float(s["stop"])
+            # ---------- manage SHORT ----------
+            if s["pos"] == -1:
+                entry = float(s["entry"]); stop = float(s["stop"])
 
-            # HA(5m) exit precedence
-            if self._maybe_exit_ha(symbol, s, last):
-                out.append({"action": "COVER", "symbol": symbol, "qty": "ALL", "type": "MKT",
-                            "ts": ts, "reason": "exit_ha_5m"})
-                self._flat(symbol, reason="exit_ha_5m", ts=ts)
-                return out
+                # HA(5m) exit precedence
+                if self._maybe_exit_ha(symbol, s, last):
+                    out.append({"action": "COVER", "symbol": symbol, "qty": "ALL", "type": "MKT",
+                                "ts": ts, "reason": "exit_ha_5m"})
+                    self._flat(symbol, reason="exit_ha_5m", ts=ts)
+                    return out
 
-            # Timeout exit (after HA override)
-            tier = self._last_entry_tier.get(symbol, "B")
-            timeout_min = self._timeout_minutes_for_tier(tier)
-            ha_cfg = getattr(self, "cfg_d", {}).get("ha_exit", {})
-            override_timeout = ha_cfg.get("override_timeout", ha_cfg.get("HA_OVERRIDES_TIMEOUT", False))
-            moved = (float(s["entry"]) - low) / float(s["entry"]) if s["entry"] else 0.0
-            tp_pct = getattr(self, "tp_pct", 0.0)
-            tp_ok = moved >= tp_pct if tp_pct > 0 else False
-            ha5m_bar = getattr(self, "ha5m", None)
-            ha_favors_short = False
-            if ha5m_bar and hasattr(ha5m_bar, "prev_ha_open") and ha5m_bar.prev_ha_open is not None:
-                ha_favors_short = ha5m_bar.prev_ha_close < ha5m_bar.prev_ha_open
-            if timeout_min > 0 and self._elapsed_minutes(s, ts) >= timeout_min:
-                # --- HA vs Timeout precedence (parity with old) ---
+                # Timeout exit (after HA override)
+                tier = self._last_entry_tier.get(symbol, "B")
+                timeout_min = self._timeout_minutes_for_tier(tier)
                 ha_cfg = getattr(self, "cfg_d", {}).get("ha_exit", {})
                 override_timeout = ha_cfg.get("override_timeout", ha_cfg.get("HA_OVERRIDES_TIMEOUT", False))
                 moved = (float(s["entry"]) - low) / float(s["entry"]) if s["entry"] else 0.0
@@ -1453,96 +1507,107 @@ class StrategyV13(StrategyBase):
                 ha_favors_short = False
                 if ha5m_bar and hasattr(ha5m_bar, "prev_ha_open") and ha5m_bar.prev_ha_open is not None:
                     ha_favors_short = ha5m_bar.prev_ha_close < ha5m_bar.prev_ha_open
-                if not (override_timeout and tp_ok and ha_favors_short):
-                    out.append({"action": "COVER", "symbol": symbol, "qty": "ALL", "type": "MKT",
-                                "ts": ts, "reason": f"timeout_{timeout_min}min"})
-                    self._flat(symbol, reason=f"timeout_{timeout_min}min", ts=ts)
+                if timeout_min > 0 and self._elapsed_minutes(s, ts) >= timeout_min:
+                    # --- HA vs Timeout precedence (parity with old) ---
+                    ha_cfg = getattr(self, "cfg_d", {}).get("ha_exit", {})
+                    override_timeout = ha_cfg.get("override_timeout", ha_cfg.get("HA_OVERRIDES_TIMEOUT", False))
+                    moved = (float(s["entry"]) - low) / float(s["entry"]) if s["entry"] else 0.0
+                    tp_pct = getattr(self, "tp_pct", 0.0)
+                    tp_ok = moved >= tp_pct if tp_pct > 0 else False
+                    ha5m_bar = ha_bar
+                    ha_favors_short = False
+                    if ha5m_bar and hasattr(ha5m_bar, "prev_ha_open") and ha5m_bar.prev_ha_open is not None:
+                        ha_favors_short = ha5m_bar.prev_ha_close < ha5m_bar.prev_ha_open
+                    if not (override_timeout and tp_ok and ha_favors_short):
+                        out.append({"action": "COVER", "symbol": symbol, "qty": "ALL", "type": "MKT",
+                                    "ts": ts, "reason": f"timeout_{timeout_min}min"})
+                        self._flat(symbol, reason=f"timeout_{timeout_min}min", ts=ts)
+                        return out
+
+                # Management helpers
+                self._maybe_activate_be(symbol, s, ts)
+                # --- Ratchet/trailing stop (SHORT) ---
+                self._maybe_ratchet_stop("short", s, close, ts, atrv, getattr(self.cfg, "ratchet_pct_short", 4.0))
+                self._apply_ratchet(symbol, s, close, ts)
+
+                # 1) hard stop
+                if high >= stop:
+                    be_exit = s.get("be_active", False) and abs(stop - entry) <= max(1e-6, 1e-6 * entry)
+                    self._flat(symbol, reason="stop_hit", ts=ts)
+                    out.append({"action":"COVER", "symbol":symbol, "qty":"ALL", "type":"MKT",
+                                "ts": ts, "reason":"stop_hit", "stop": stop})
+                    self._dbg(symbol, last, tag="EXIT_STOP", extra={"stop": f"{stop:.4f}", "high": f"{high:.4f}"})
+                    if be_exit and getattr(self.cfg, "allow_reentry_after_be", False):
+                        s["allow_reentry_short"] = True
                     return out
 
-            # Management helpers
-            self._maybe_activate_be(symbol, s, ts)
-            # --- Ratchet/trailing stop (SHORT) ---
-            self._maybe_ratchet_stop("short", s, close, ts, atrv, getattr(self.cfg, "ratchet_pct_short", 4.0))
-            self._apply_ratchet(symbol, s, close, ts)
-
-            # 1) hard stop
-            if high >= stop:
-                be_exit = s.get("be_active", False) and abs(stop - entry) <= max(1e-6, 1e-6 * entry)
-                self._flat(symbol, reason="stop_hit", ts=ts)
-                out.append({"action":"COVER", "symbol":symbol, "qty":"ALL", "type":"MKT",
-                            "ts": ts, "reason":"stop_hit", "stop": stop})
-                self._dbg(symbol, last, tag="EXIT_STOP", extra={"stop": f"{stop:.4f}", "high": f"{high:.4f}"})
-                if be_exit and getattr(self.cfg, "allow_reentry_after_be", False):
-                    s["allow_reentry_short"] = True
-                return out
-
-            # 2) trail stop by ATR (SHORT   direction=-1)
-            new_stop = self._trail_stop(close, atrv, stop, direction=-1)
-            if new_stop < stop:
-                if s.get("be_active", False):
-                    # Never move stop above the entry price once BE is active (SHORT)
-                    new_stop = min(new_stop, float(s["entry"]))
-                s["stop"] = self._set_stop("SHORT", symbol, ts, close, new_stop, s["entry"], stop, reason="trail_atr")
+                # 2) trail stop by ATR (SHORT   direction=-1)
+                new_stop = self._trail_stop(close, atrv, stop, direction=-1)
+                if new_stop < stop:
+                    if s.get("be_active", False):
+                        # Never move stop above the entry price once BE is active (SHORT)
+                        new_stop = min(new_stop, float(s["entry"]))
+                    s["stop"] = self._set_stop("SHORT", symbol, ts, close, new_stop, s["entry"], stop, reason="trail_atr")
 
 
-            # 3) partials   SHORT (cumulative-of-original)
-            filled = int(s.get("took_partial", 0))
-            moved  = (float(s["entry"]) - low) / float(s["entry"]) if s["entry"] else 0.0
-            levels = list(self.cfg_d.get("partial_levels", []))
+                # 3) partials   SHORT (cumulative-of-original)
+                filled = int(s.get("took_partial", 0))
+                moved  = (float(s["entry"]) - low) / float(s["entry"]) if s["entry"] else 0.0
+                levels = list(self.cfg_d.get("partial_levels", []))
 
-            while filled < len(levels) and s["size"] > 0:
-                lvl = levels[filled]
-                if moved < float(lvl["move_pct"]):
-                    break
+                while filled < len(levels) and s["size"] > 0:
+                    lvl = levels[filled]
+                    if moved < float(lvl["move_pct"]):
+                        break
 
-                orig = int(s.get("orig_size", s["size"]))
-                exited_so_far = orig - s["size"]
-                cum_frac = sum(float(levels[i]["exit_fraction"]) for i in range(filled + 1))
-                target_exited = int(round(orig * cum_frac))
-                qty = max(0, min(target_exited - exited_so_far, s["size"]))
+                    orig = int(s.get("orig_size", s["size"]))
+                    exited_so_far = orig - s["size"]
+                    cum_frac = sum(float(levels[i]["exit_fraction"]) for i in range(filled + 1))
+                    target_exited = int(round(orig * cum_frac))
+                    qty = max(0, min(target_exited - exited_so_far, s["size"]))
 
-                if getattr(self, "debug_partials", False):
-                    self._log(f"[PARTIAL DEBUG] lvl={filled+1} mv={float(lvl['move_pct']):.4f} "
-                              f"orig={orig} sold_so_far={exited_so_far} desired_cum={target_exited} to_sell={qty}")
+                    if getattr(self, "debug_partials", False):
+                        self._log(f"[PARTIAL DEBUG] lvl={filled+1} mv={float(lvl['move_pct']):.4f} "
+                                f"orig={orig} sold_so_far={exited_so_far} desired_cum={target_exited} to_sell={qty}")
 
-                if qty <= 0:
-                    break
+                    if qty <= 0:
+                        break
 
-                s["size"] -= qty
-                out.append({"action": "BUY_TO_COVER", "symbol": symbol, "qty": qty, "type": "MKT",
-                            "ts": ts, "reason": f"partial_{filled+1}_at_{float(lvl['move_pct'])*100:.2f}%"})
-                self._dbg(symbol, last, tag="PARTIAL",
-                          extra={"level": filled+1, "exit_frac": lvl["exit_fraction"], "qty": qty, "rem": s["size"]})
+                    s["size"] -= qty
+                    out.append({"action": "BUY_TO_COVER", "symbol": symbol, "qty": qty, "type": "MKT",
+                                "ts": ts, "reason": f"partial_{filled+1}_at_{float(lvl['move_pct'])*100:.2f}%"})
+                    self._dbg(symbol, last, tag="PARTIAL",
+                            extra={"level": filled+1, "exit_frac": lvl["exit_fraction"], "qty": qty, "rem": s["size"]})
 
-                filled += 1
-                if getattr(self.cfg, "partial_one_per_bar", False):
-                    break
+                    filled += 1
+                    if getattr(self.cfg, "partial_one_per_bar", False):
+                        break
 
-            s["took_partial"] = filled
-            if s["size"] == 0:
-                self._flat(symbol, reason="all_partials_exit", ts=ts)
-                return out
+                s["took_partial"] = filled
+                if s["size"] == 0:
+                    self._flat(symbol, reason="all_partials_exit", ts=ts)
+                    return out
 
-            # --- Ratchet/trailing stop (SHORT) after partials ---
-            self._maybe_ratchet_stop("short", s, close, ts, atrv, getattr(self.cfg, "ratchet_pct_short", 4.0))
+                # --- Ratchet/trailing stop (SHORT) after partials ---
+                self._maybe_ratchet_stop("short", s, close, ts, atrv, getattr(self.cfg, "ratchet_pct_short", 4.0))
 
-            # 4) BE activation after N partials
-            if s["size"] > 0 and filled >= int(getattr(self.cfg, "be_after_partials", 0)):
-                proposed = min(s["stop"], entry)
-                # Clamp BE for SHORT: never above entry
-                proposed = min(proposed, entry)
-                s["stop"]  = self._set_stop("SHORT", symbol, ts, close, proposed, entry, s["stop"], reason="be_after_partials")
-                s["be_active"] = True
+                # 4) BE activation after N partials
+                if s["size"] > 0 and filled >= int(getattr(self.cfg, "be_after_partials", 0)):
+                    proposed = min(s["stop"], entry)
+                    # Clamp BE for SHORT: never above entry
+                    proposed = min(proposed, entry)
+                    s["stop"]  = self._set_stop("SHORT", symbol, ts, close, proposed, entry, s["stop"], reason="be_after_partials")
+                    s["be_active"] = True
 
-            # 5) bias exit (cross up)
-            bullish_cross = (p_ema9 <= p_ema20) and (ema9 > p_ema20)
-            if bullish_cross and getattr(self.cfg, "bias_exit_on_cross", False):
-                self._flat(symbol, reason="bias_exit", ts=ts)
-                out.append({"action":"COVER", "symbol":symbol, "qty":"ALL", "type":"MKT", "ts": ts, "reason":"bias_exit"})
-                self._dbg(symbol, last, tag="EXIT_BIAS")
-                return out
+                # 5) bias exit (cross up)
+                bullish_cross = (p_ema9 <= p_ema20) and (ema9 > ema20)
+                if bullish_cross and getattr(self.cfg, "bias_exit_on_cross", False):
+                    self._flat(symbol, reason="bias_exit", ts=ts)
+                    out.append({"action":"COVER", "symbol":symbol, "qty":"ALL", "type":"MKT", "ts": ts, "reason":"bias_exit"})
+                    self._dbg(symbol, last, tag="EXIT_BIAS")
+                    return out
 
-            return None
+                return None
 
     def _profit_pct(self, s: dict, price: float) -> float:
         """

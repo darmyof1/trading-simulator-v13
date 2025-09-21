@@ -9,7 +9,7 @@ import csv
 import uuid
 import sys
 import os
-
+#
 # === CONFIGURATION ===
 # --- Ratcheting stop (step-ladder) ---
 ENABLE_RATCHET_STOPS = True

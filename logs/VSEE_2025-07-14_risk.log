@@ -1,0 +1,20 @@
+[StrategyV13] start date=2025-07-14 symbols=['VSEE']
+[SIG] SELL_SHORT | sym=VSEE | ts=2025-07-14T13:04:00+00:00 | close=1.4800 | ema9=1.5645 | ema20=1.5751 | macd=-0.0084 | sig=-0.0036 | vwap=1.6641 | atr=0.0770 | entry=1.4800 | stop=1.6339 | R=0.1539 | size=324
+[PARTIAL DEBUG] lvl=1 mv=0.0050 orig=324 sold_so_far=0 desired_cum=81 to_sell=81
+[SIG] PARTIAL | sym=VSEE | ts=2025-07-14T13:05:00+00:00 | close=1.4600 | ema9=1.5436 | ema20=1.5642 | macd=-0.0165 | sig=-0.0062 | vwap=1.6620 | atr=0.0772 | level=1 | exit_frac=0.25 | qty=81 | rem=243
+[PARTIAL DEBUG] lvl=2 mv=0.0100 orig=324 sold_so_far=81 desired_cum=162 to_sell=81
+[SIG] PARTIAL | sym=VSEE | ts=2025-07-14T13:06:00+00:00 | close=1.4700 | ema9=1.5289 | ema20=1.5552 | macd=-0.0218 | sig=-0.0093 | vwap=1.6610 | atr=0.0738 | level=2 | exit_frac=0.25 | qty=81 | rem=162
+[SIG] EXIT_STOP | sym=VSEE | ts=2025-07-14T13:07:00+00:00 | close=1.4700 | ema9=1.5171 | ema20=1.5471 | macd=-0.0257 | sig=-0.0126 | vwap=1.6606 | atr=0.0700 | stop=1.4800 | high=1.4800
+[SIG] SELL_SHORT | sym=VSEE | ts=2025-07-14T13:33:00+00:00 | close=1.4600 | ema9=1.5304 | ema20=1.5386 | macd=-0.0048 | sig=0.0035 | vwap=1.6432 | atr=0.0441 | entry=1.4600 | stop=1.5481 | R=0.0881 | size=567
+[PARTIAL DEBUG] lvl=1 mv=0.0050 orig=567 sold_so_far=0 desired_cum=142 to_sell=142
+[SIG] PARTIAL | sym=VSEE | ts=2025-07-14T13:34:00+00:00 | close=1.3800 | ema9=1.5003 | ema20=1.5235 | macd=-0.0168 | sig=-0.0006 | vwap=1.6420 | atr=0.0466 | level=1 | exit_frac=0.25 | qty=142 | rem=425
+[PARTIAL DEBUG] lvl=2 mv=0.0100 orig=567 sold_so_far=142 desired_cum=284 to_sell=142
+[SIG] PARTIAL | sym=VSEE | ts=2025-07-14T13:35:00+00:00 | close=1.4300 | ema9=1.4862 | ema20=1.5146 | macd=-0.0221 | sig=-0.0049 | vwap=1.6406 | atr=0.0469 | level=2 | exit_frac=0.25 | qty=142 | rem=283
+[PARTIAL DEBUG] lvl=3 mv=0.0200 orig=567 sold_so_far=284 desired_cum=567 to_sell=283
+[SIG] PARTIAL | sym=VSEE | ts=2025-07-14T13:36:00+00:00 | close=1.4400 | ema9=1.4770 | ema20=1.5075 | macd=-0.0251 | sig=-0.0089 | vwap=1.6395 | atr=0.0457 | level=3 | exit_frac=0.5 | qty=283 | rem=0
+[SIG] BUY | sym=VSEE | ts=2025-07-14T13:02:00+00:00 | close=1.6500 | ema9=1.5971 | ema20=1.5905 | macd=0.0028 | sig=-0.0052 | vwap=1.6215 | atr=0.0718 | entry=1.6500 | stop=1.5065 | R=0.1435 | size=348
+[PARTIAL DEBUG] lvl=1 mv=0.0050 orig=348 sold_so_far=0 desired_cum=87 to_sell=87
+[SIG] PARTIAL | sym=VSEE | ts=2025-07-14T13:03:00+00:00 | close=1.5400 | ema9=1.5857 | ema20=1.5857 | macd=-0.0017 | sig=-0.0045 | vwap=1.6210 | atr=0.0774 | level=1 | exit_frac=0.25 | qty=87 | rem=261
+[SIG] EXIT_BIAS | sym=VSEE | ts=2025-07-14T13:03:00+00:00 | close=1.5400 | ema9=1.5857 | ema20=1.5857 | macd=-0.0017 | sig=-0.0045 | vwap=1.6210 | atr=0.0774
+[StrategyV13] end
+[RESULTS] dumped to logs/results/StrategyV13_2025-07-14_VSEE_risk.json

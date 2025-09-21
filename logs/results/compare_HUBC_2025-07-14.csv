@@ -1,0 +1,5 @@
+run_file,symbol,side,size,partials_qtys,cum_of_original_ok,PnL_$,PnL_R,exit_causes
+StrategyV13_2025-07-14_HUBC,HUBC,BUY,3184,"[64, 318]",True,313.28,0.31,['EXIT_STOP']
+StrategyV13_2025-07-14_HUBC,HUBC,SELL_SHORT,3333,[],True,0.0,0.0,['EXIT_HA_5M']
+StrategyV13_2025-07-14_HUBC_risk,HUBC,BUY,3184,"[64, 318]",True,313.28,0.31,['EXIT_STOP']
+StrategyV13_2025-07-14_HUBC_risk,HUBC,SELL_SHORT,3333,[],True,0.0,0.0,['EXIT_HA_5M']
